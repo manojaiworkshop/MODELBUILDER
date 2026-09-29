@@ -1,0 +1,38 @@
+[package]
+name = "modelbuilder-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+socketioxide = "0.18"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- document ingestion ---
+pdf-extract = "0.9"          # PDF text layer
+calamine = "0.26"            # xlsx / xls / xlsm / ods
+zip = { version = "2", default-features = false, features = ["deflate"] }   # docx / pptx / odf / epub / zip archives
+quick-xml = "0.37"
+encoding_rs = "0.8"          # UTF-16 / windows-1252 / … -> UTF-8
+flate2 = "1"                 # .gz
+rayon = "1"                  # parallel tokenization of huge corpora
+futures-util = "0.3"
+
+# CPU-only training engine: tensors + autograd, pure Rust.
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+
+[profile.dev]
+opt-level = 3        # tensor math is unusably slow unoptimized
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,348 @@
+//! One `Session` per connected browser tab: its uploaded documents, the tokenized dataset built
+//! from them, and any trained weights. Also the process-wide `Shared` state (limits, registry).
+//!
+//! Data flow:  upload (HTTP, streamed to disk) -> extract to UTF-8 text (blocking pool, bounded)
+//!             -> [debounced, cancellable] rebuild: sample -> train BPE -> parallel encode
+//!             -> `data:info`. Progress is pushed as `data:progress`; the document list as `data:docs`.
+
+use crate::corpus;
+use crate::events::{DataInfo, TokenInfo};
+use crate::extract::{self, Kind};
+use crate::tokenizer::Tokenized;
+use crate::train::TrainedSlot;
+use serde::Serialize;
+use socketioxide::extract::SocketRef;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+/// Process-wide limits and registries. All sizes are overridable by environment variables.
+pub struct Shared {
+    pub trainings: Arc<Semaphore>,
+    pub extractions: Arc<Semaphore>,
+    pub builds: Arc<Semaphore>,
+    pub sessions: Mutex<HashMap<String, Arc<Session>>>,
+    pub data_dir: PathBuf,
+    /// Largest single upload.
+    pub max_file_bytes: u64,
+    /// Total bytes one session may keep on disk (uploads in flight + extracted text).
+    pub max_session_bytes: u64,
+    /// Cap on the text extracted from one document.
+    pub max_doc_text: u64,
+    /// Cap on tokens kept for training (u16 each).
+    pub max_tokens: usize,
+}
+
+fn env_u64(k: &str, d: u64) -> u64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+impl Shared {
+    pub fn from_env() -> Arc<Shared> {
+        let data_dir = std::env::var("DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("modelbuilder"));
+        // leftovers from a previous run are ours to clear
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::create_dir_all(&data_dir);
+        Arc::new(Shared {
+            trainings: Arc::new(Semaphore::new(env_u64("MAX_TRAININGS", 2) as usize)),
+            extractions: Arc::new(Semaphore::new(env_u64("MAX_EXTRACTIONS", 2) as usize)),
+            builds: Arc::new(Semaphore::new(env_u64("MAX_BUILDS", 2) as usize)),
+            sessions: Mutex::new(HashMap::new()),
+            data_dir,
+            max_file_bytes: env_u64("MAX_UPLOAD_BYTES", 1 << 30),
+            max_session_bytes: env_u64("MAX_SESSION_BYTES", 4 << 30),
+            max_doc_text: env_u64("MAX_DOC_TEXT_BYTES", 2 << 30),
+            max_tokens: env_u64("MAX_TOKENS", 500_000_000) as usize,
+        })
+    }
+
+    pub fn session(&self, sid: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().unwrap().get(sid).cloned()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum DocState {
+    Extracting,
+    Ready,
+    Error,
+}
+
+#[derive(Clone)]
+pub struct Doc {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub state: DocState,
+    pub kind: Option<Kind>,
+    /// Bytes of extracted text.
+    pub text_bytes: u64,
+    pub note: Option<String>,
+    pub error: Option<String>,
+    pub enabled: bool,
+    pub text_path: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocView {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub state: DocState,
+    pub kind: Option<&'static str>,
+    pub text_bytes: u64,
+    pub note: Option<String>,
+    pub error: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocsPayload {
+    docs: Vec<DocView>,
+    total_size: u64,
+}
+
+#[derive(Serialize)]
+struct ProgressPayload {
+    stage: &'static str,
+    pct: f32,
+    message: String,
+}
+
+#[derive(Default)]
+pub struct DataState {
+    pub docs: Vec<Doc>,
+    pub pasted: String,
+    pub use_pasted: bool,
+    pub merges: usize,
+    pub tok: Option<Arc<Tokenized>>,
+    next_id: u32,
+}
+
+impl DataState {
+    pub fn new_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("d{}", self.next_id)
+    }
+}
+
+pub struct Session {
+    pub id: String,
+    pub dir: PathBuf,
+    pub socket: SocketRef,
+    pub shared: Arc<Shared>,
+    pub data: tokio::sync::Mutex<DataState>,
+    pub trained: TrainedSlot,
+    pub probe: Arc<Mutex<String>>,
+    pub train_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub gen_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// Bumped on every change that needs a new dataset; a rebuild only finishes if it is still current.
+    pub gen: AtomicU64,
+    build_cancel: Mutex<Arc<AtomicBool>>,
+    /// Bytes of uploads + extracted text currently on disk.
+    pub disk_used: AtomicU64,
+}
+
+impl Session {
+    pub fn new(socket: SocketRef, shared: Arc<Shared>) -> Arc<Session> {
+        let id: String = socket.id.to_string().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+        let dir = shared.data_dir.join(&id);
+        let _ = std::fs::create_dir_all(dir.join("up"));
+        let _ = std::fs::create_dir_all(dir.join("txt"));
+        let s = Arc::new(Session {
+            id: id.clone(),
+            dir,
+            socket,
+            shared: shared.clone(),
+            data: Default::default(),
+            trained: Arc::new(Mutex::new(None)),
+            probe: Arc::new(Mutex::new(String::new())),
+            train_cancel: Mutex::new(None),
+            gen_cancel: Mutex::new(None),
+            gen: AtomicU64::new(0),
+            build_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            disk_used: AtomicU64::new(0),
+        });
+        shared.sessions.lock().unwrap().insert(id, s.clone());
+        s
+    }
+
+    /// Stop everything and delete this session's files.
+    pub fn close(&self) {
+        for slot in [&self.train_cancel, &self.gen_cancel] {
+            if let Some(c) = slot.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+        }
+        self.build_cancel.lock().unwrap().store(true, Ordering::Relaxed);
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        self.shared.sessions.lock().unwrap().remove(&self.id);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    pub async fn emit_docs(&self) {
+        let d = self.data.lock().await;
+        let docs: Vec<DocView> = d
+            .docs
+            .iter()
+            .map(|x| DocView {
+                id: x.id.clone(),
+                name: x.name.clone(),
+                size: x.size,
+                state: x.state,
+                kind: x.kind.map(|k| k.label()),
+                text_bytes: x.text_bytes,
+                note: x.note.clone(),
+                error: x.error.clone(),
+                enabled: x.enabled,
+            })
+            .collect();
+        let total_size = docs.iter().map(|x| x.size).sum();
+        let _ = self.socket.emit("data:docs", &DocsPayload { docs, total_size });
+    }
+
+    fn progress(&self, stage: &'static str, pct: f32, message: String) {
+        let _ = self.socket.emit("data:progress", &ProgressPayload { stage, pct, message });
+    }
+
+    pub fn emit_info(&self, info: &DataInfo) {
+        let _ = self.socket.emit("data:info", info);
+    }
+
+    /// Extract a freshly uploaded file, then rebuild the dataset.
+    pub fn spawn_extraction(self: &Arc<Self>, id: String, raw: PathBuf, name: String) {
+        let s = self.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = s.shared.extractions.clone().acquire_owned().await else { return };
+            let out = s.dir.join("txt").join(format!("{id}.txt"));
+            let scratch = s.dir.join("scratch").join(&id);
+            let (cap, o2, s2) = (s.shared.max_doc_text, out.clone(), scratch.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract::extract_to(&raw, &name, &o2, &s2, cap)));
+                let _ = std::fs::remove_file(&raw);
+                let _ = std::fs::remove_dir_all(&s2);
+                r.unwrap_or_else(|_| Err("The extractor crashed on this file.".to_string()))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("extraction failed: {e}")));
+
+            {
+                let mut d = s.data.lock().await;
+                if let Some(doc) = d.docs.iter_mut().find(|x| x.id == id) {
+                    match res {
+                        Ok(o) => {
+                            s.disk_used.fetch_add(o.bytes, Ordering::Relaxed);
+                            doc.state = DocState::Ready;
+                            doc.kind = Some(o.kind);
+                            doc.text_bytes = o.bytes;
+                            doc.note = o.note;
+                            doc.text_path = Some(out);
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&out);
+                            doc.state = DocState::Error;
+                            doc.error = Some(e);
+                        }
+                    }
+                }
+            }
+            s.emit_docs().await;
+            s.schedule_rebuild();
+        });
+    }
+
+    /// (Re)build the tokenized dataset from the current sources. Debounced, and supersedes any
+    /// build already running. Waits while documents are still being extracted (their completion
+    /// calls this again).
+    pub fn schedule_rebuild(self: &Arc<Self>) {
+        let my = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        std::mem::replace(&mut *self.build_cancel.lock().unwrap(), cancel.clone()).store(true, Ordering::Relaxed);
+        let s = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            if s.gen.load(Ordering::SeqCst) != my {
+                return;
+            }
+            let (files, merges) = {
+                let d = s.data.lock().await;
+                if d.docs.iter().any(|x| x.state == DocState::Extracting) {
+                    return;
+                }
+                let mut files = Vec::new();
+                if d.use_pasted && !d.pasted.trim().is_empty() {
+                    let p = s.dir.join("pasted.txt");
+                    if std::fs::write(&p, &d.pasted).is_ok() {
+                        files.push(p);
+                    }
+                }
+                files.extend(d.docs.iter().filter(|x| x.enabled && x.state == DocState::Ready).filter_map(|x| x.text_path.clone()));
+                (files, d.merges)
+            };
+            let sources = files.len();
+            if files.is_empty() {
+                s.data.lock().await.tok = None;
+                s.progress("done", 1.0, String::new());
+                s.emit_info(&DataInfo::failed("There is no text to train on yet. Paste some text or upload a file."));
+                return;
+            }
+            let Ok(_permit) = s.shared.builds.clone().acquire_owned().await else { return };
+            if s.gen.load(Ordering::SeqCst) != my {
+                return;
+            }
+            let started = Instant::now();
+            s.progress("tokenizer", 0.0, "Preparing…".into());
+            let (sock, last) = (s.socket.clone(), AtomicU32::new(u32::MAX));
+            let cfg = corpus::Cfg { merges, max_tokens: s.shared.max_tokens, ..Default::default() };
+            let res = tokio::task::spawn_blocking(move || {
+                let report = |stage: &'static str, pct: f32, message: String| {
+                    // at most one event per percent
+                    let key = (pct * 100.0) as u32 + if stage == "encode" { 1000 } else { 0 };
+                    if last.swap(key, Ordering::Relaxed) != key {
+                        let _ = sock.emit("data:progress", &ProgressPayload { stage, pct, message });
+                    }
+                };
+                corpus::build(&files, &cfg, &cancel, &report)
+            })
+            .await;
+            if s.gen.load(Ordering::SeqCst) != my {
+                return; // superseded while building
+            }
+            s.progress("done", 1.0, String::new());
+            match res {
+                Ok(Ok(t)) => {
+                    let t = Arc::new(t);
+                    let info = data_info(&t, merges, sources, started.elapsed());
+                    s.data.lock().await.tok = Some(t);
+                    s.emit_info(&info);
+                }
+                Ok(Err(e)) if e == "cancelled" => {}
+                Ok(Err(e)) => s.emit_info(&DataInfo::failed(e)),
+                Err(e) => s.emit_info(&DataInfo::failed(format!("tokenization crashed: {e}"))),
+            }
+        });
+    }
+}
+
+pub fn data_info(tok: &Tokenized, merges: usize, sources: usize, took: Duration) -> DataInfo {
+    DataInfo {
+        ok: true,
+        error: None,
+        chars: tok.chars,
+        tokens: tok.ids.len(),
+        vocab_size: tok.bpe.vocab_size(),
+        merges: tok.bpe.n_merges().min(merges),
+        compression: if tok.ids.is_empty() { 0.0 } else { tok.chars as f32 / tok.ids.len() as f32 },
+        preview: tok.ids.iter().take(48).map(|&id| TokenInfo { id: id as u32, text: tok.bpe.token_text(id as u32) }).collect(),
+        sources,
+        bytes: tok.bytes,
+        truncated: tok.truncated,
+        build_ms: took.as_millis() as u64,
+    }
+}

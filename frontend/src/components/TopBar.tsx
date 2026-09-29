@@ -1,0 +1,75 @@
+"use client";
+import { Layers3, Moon, Play, Square, Sun } from "lucide-react";
+import { PRESETS } from "@/lib/presets";
+import { isRunning, useStudio } from "@/lib/store";
+import { startTraining, stopTraining } from "@/lib/sync";
+import { backendUrl } from "@/lib/backend";
+import { Button, cn, useTheme } from "./ui/kit";
+
+function ConnPill() {
+  const conn = useStudio((s) => s.conn);
+  const map = {
+    connected: ["bg-ok", "Connected"],
+    connecting: ["bg-warn", "Connecting…"],
+    disconnected: ["bg-danger", "Backend offline"],
+  } as const;
+  const [dot, label] = map[conn];
+  return (
+    <span className="hidden items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs text-muted sm:inline-flex" title={backendUrl()}>
+      <span className={cn("h-2 w-2 rounded-full", dot, conn === "connecting" && "animate-pulse")} />
+      {label}
+    </span>
+  );
+}
+
+export function TopBar() {
+  const [theme, toggle] = useTheme();
+  const setBlocks = useStudio((s) => s.setBlocks);
+  const status = useStudio((s) => s.status);
+  const conn = useStudio((s) => s.conn);
+  const blocked = useStudio((s) => !!s.inspect && !s.inspect.ok);
+  const running = isRunning(status);
+
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-3 sm:px-4">
+      <div className="flex items-center gap-2.5">
+        <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-accent-fg"><Layers3 size={18} /></span>
+        <div className="leading-tight">
+          <div className="text-sm font-semibold">ModelBuilder</div>
+          <div className="hidden text-[11px] text-muted sm:block">build · train · observe a transformer</div>
+        </div>
+      </div>
+
+      <div className="mx-1 hidden h-6 w-px bg-border md:block" />
+      <label className="hidden items-center gap-2 text-xs text-muted md:flex">
+        Preset
+        <select
+          aria-label="Load a preset architecture"
+          disabled={running}
+          value=""
+          onChange={(e) => {
+            const p = PRESETS.find((x) => x.id === e.target.value);
+            if (p) setBlocks(p.build());
+          }}
+          className="h-8 w-44 rounded-md border border-border bg-surface px-2 text-sm text-fg outline-none focus:border-accent disabled:opacity-50"
+        >
+          <option value="" disabled>Load…</option>
+          {PRESETS.map((p) => <option key={p.id} value={p.id} title={p.blurb}>{p.name}</option>)}
+        </select>
+      </label>
+
+      <div className="flex-1" />
+      <ConnPill />
+      {running ? (
+        <Button variant="danger" onClick={() => stopTraining()}><Square size={14} fill="currentColor" /> Stop</Button>
+      ) : (
+        <Button variant="primary" disabled={conn !== "connected" || blocked} onClick={() => startTraining()} title={blocked ? "Fix the model errors first" : "Train the model on your text"}>
+          <Play size={14} fill="currentColor" /> Run
+        </Button>
+      )}
+      <button onClick={toggle} aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"} className="rounded-lg p-2 text-muted hover:bg-surface-2 hover:text-fg">
+        {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+      </button>
+    </header>
+  );
+}

@@ -1,0 +1,2 @@
+TXTMARK plain utf-8 text with ünïcode and 日本語.
+Second line.
