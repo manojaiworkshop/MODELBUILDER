@@ -7,7 +7,7 @@
 //!    results in order. Chunks are cut on newline/space so no word is split.
 //! 3. Stop at a token limit (default 500 M tokens = 1 GB of `u16`) and say so.
 
-use crate::tokenizer::{Bpe, Tokenized};
+use crate::tokenizer::{compact_ids, Bpe, ImportedTok, Tokenized};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -23,11 +23,16 @@ pub struct Cfg {
     pub merges: usize,
     pub max_tokens: usize,
     pub sample_bytes: u64,
+    /// An imported tokenizer.json to use instead of learning the built-in BPE.
+    pub custom: Option<std::sync::Arc<ImportedTok>>,
 }
+
+/// An imported tokenizer's ids are held as `u32` until they are compacted, so its corpus is capped lower.
+const IMPORTED_MAX_TOKENS: usize = 100_000_000;
 
 impl Default for Cfg {
     fn default() -> Self {
-        Cfg { merges: 200, max_tokens: 500_000_000, sample_bytes: SAMPLE_BYTES }
+        Cfg { merges: 200, max_tokens: 500_000_000, sample_bytes: SAMPLE_BYTES, custom: None }
     }
 }
 
@@ -167,6 +172,9 @@ pub fn build(files: &[PathBuf], cfg: &Cfg, cancel: &AtomicBool, progress: Progre
         return Err("There is no text to train on yet. Paste some text or upload a file.".into());
     }
 
+    if let Some(tok) = &cfg.custom {
+        return build_imported(files, tok, cfg, cancel, progress, total);
+    }
     progress("tokenizer", 0.0, format!("Sampling {} to learn the vocabulary…", mb(total.min(cfg.sample_bytes))));
     let text = sample(files, cfg.sample_bytes).map_err(|e| e.to_string())?;
     if cancel.load(Ordering::Relaxed) {
@@ -206,6 +214,32 @@ pub fn build(files: &[PathBuf], cfg: &Cfg, cancel: &AtomicBool, progress: Progre
     })?;
     ids.shrink_to_fit();
     progress("encode", 1.0, format!("{} tokens", ids.len()));
+    Ok(Tokenized::from_parts(bpe, ids, chars, total, counts, truncated))
+}
+
+/// Tokenizes with an imported tokenizer.json, then keeps only the ids the data uses (see `Compact`).
+fn build_imported(files: &[PathBuf], tok: &std::sync::Arc<ImportedTok>, cfg: &Cfg, cancel: &AtomicBool, progress: Progress, total: u64) -> Result<Tokenized, String> {
+    progress("tokenizer", 1.0, format!("Using {} ({} ids)", tok.name, tok.full_vocab));
+    progress("encode", 0.0, format!("Tokenizing {}…", mb(total)));
+    let cap = cfg.max_tokens.min(IMPORTED_MAX_TOKENS);
+    let threads = rayon::current_num_threads().max(1);
+    let mut raw: Vec<u32> = Vec::new();
+    let (mut chars, mut truncated) = (0usize, false);
+    for_each_batch(files, threads * 2, cancel, progress, total, |chunks| {
+        let encoded: Vec<(Vec<u32>, usize)> = chunks.par_iter().map(|c| (tok.encode_raw(c), c.chars().count())).collect();
+        for (ids, n) in encoded {
+            let take = ids.len().min(cap - raw.len());
+            raw.extend_from_slice(&ids[..take]);
+            chars += n;
+            if take < ids.len() {
+                truncated = true;
+                return false;
+            }
+        }
+        true
+    })?;
+    progress("encode", 1.0, format!("{} tokens, keeping the ids the data uses…", raw.len()));
+    let (bpe, ids, counts) = compact_ids(tok, &raw)?;
     Ok(Tokenized::from_parts(bpe, ids, chars, total, counts, truncated))
 }
 
@@ -275,5 +309,24 @@ mod tests {
         let p = dir.path().join("t.txt");
         fs::write(&p, words(50_000, 1)).unwrap();
         assert_eq!(build(&[p], &Cfg::default(), &AtomicBool::new(true), &no_progress).err().unwrap(), "cancelled");
+    }
+
+    #[test]
+    fn builds_with_an_imported_tokenizer_and_keeps_used_ids_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let text = "the cat sat on the mat. the dog sat on the log.\n".repeat(300);
+        fs::write(&path, &text).unwrap();
+        // a tokenizer.json in the standard format (here: our own BPE, written out)
+        let (json, _) = crate::export::tokenizer_json(&Bpe::train(&text, 40));
+        let tok = std::sync::Arc::new(ImportedTok::parse("mine.json", serde_json::to_vec(&json).unwrap()).unwrap());
+        let cfg = Cfg { custom: Some(tok.clone()), ..Default::default() };
+        let t = build(&[path], &cfg, &AtomicBool::new(false), &|_, _, _| {}).unwrap();
+        assert!(t.bpe.imported().is_some());
+        assert!(t.bpe.vocab_size() < tok.full_vocab, "only ids the text uses: {} of {}", t.bpe.vocab_size(), tok.full_vocab);
+        assert_eq!(t.counts.iter().sum::<u64>() as usize, t.ids.len());
+        let decoded = t.bpe.decode_ids(&t.ids.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        assert!(decoded.starts_with("the cat sat on the mat. the dog"), "{decoded:?}");
+        assert_eq!(decoded.len(), text.len() + 2, "text plus the document separator");
     }
 }

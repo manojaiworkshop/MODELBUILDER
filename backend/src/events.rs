@@ -94,7 +94,8 @@ pub struct TrainStartReq {
     pub hyper: Hyper,
     #[serde(default)]
     pub probe: String,
-    /// What to train on: the uploaded / pasted text, or the generated question-answer pairs.
+    /// What to train on: the uploaded / pasted text, the generated question-answer pairs, or the
+    /// generated summaries.
     #[serde(default)]
     pub source: TrainSource,
     /// Start from fresh weights, or keep training the model from the previous run.
@@ -108,6 +109,7 @@ pub enum TrainSource {
     #[default]
     Text,
     Qa,
+    Summary,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -132,6 +134,12 @@ pub struct QaGenerateReq {
     pub pages: Vec<usize>,
     #[serde(default = "d_per_page")]
     pub per_page: usize,
+    /// Output style the model writes in (and how the pairs are laid out for training).
+    #[serde(default)]
+    pub style: crate::hfdata::Style,
+    /// Optional system prompt stored on chat-style pairs.
+    #[serde(default)]
+    pub system: String,
     #[serde(default = "d_parallel")]
     pub concurrency: usize,
 }
@@ -140,6 +148,32 @@ fn d_parallel() -> usize { 4 }
 
 #[derive(Debug, Deserialize)]
 pub struct QaRemoveReq {
+    /// Pair ids to delete; empty = delete all.
+    #[serde(default)]
+    pub ids: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummarizeGenerateReq {
+    pub llm: LlmConfig,
+    pub id: String,
+    /// 1-based page (or section) numbers.
+    pub pages: Vec<usize>,
+    #[serde(default = "d_sentences")]
+    pub sentences: usize,
+    #[serde(default)]
+    pub style: crate::hfdata::Style,
+    /// Optional system prompt stored on chat-style pairs.
+    #[serde(default)]
+    pub system: String,
+    #[serde(default = "d_parallel")]
+    pub concurrency: usize,
+}
+fn d_sentences() -> usize { 3 }
+
+#[derive(Debug, Deserialize)]
+pub struct SummarizeRemoveReq {
     /// Pair ids to delete; empty = delete all.
     #[serde(default)]
     pub ids: Vec<u32>,
@@ -214,6 +248,20 @@ impl InspectPayload {
     }
 }
 
+/// Which tokenizer the next dataset build uses (pushed as `data:tokenizer`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenizerInfo {
+    /// "default" (the built-in byte-level BPE) or "imported".
+    pub kind: &'static str,
+    /// File name of an imported tokenizer.json.
+    pub name: String,
+    /// Model type of an imported tokenizer ("BPE", "Unigram", …).
+    pub model: String,
+    /// Ids an imported tokenizer defines.
+    pub full_vocab: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataInfo {
@@ -222,6 +270,8 @@ pub struct DataInfo {
     pub chars: usize,
     pub tokens: usize,
     pub vocab_size: usize,
+    /// Ids the imported tokenizer defines (0 for the built-in one); `vocab_size` is how many of them the data uses.
+    pub full_vocab: usize,
     pub merges: usize,
     /// chars / tokens
     pub compression: f32,
@@ -239,7 +289,7 @@ pub struct DataInfo {
 impl DataInfo {
     pub fn failed(error: impl Into<String>) -> Self {
         DataInfo {
-            ok: false, error: Some(error.into()), chars: 0, tokens: 0, vocab_size: 0, merges: 0, compression: 0.0,
+            ok: false, error: Some(error.into()), chars: 0, tokens: 0, vocab_size: 0, full_vocab: 0, merges: 0, compression: 0.0,
             preview: vec![], sources: 0, bytes: 0, truncated: false, build_ms: 0,
         }
     }

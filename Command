@@ -1,0 +1,2 @@
+fuser -k 4000/tcp     # kill whatever holds port 4000
+./dev.sh

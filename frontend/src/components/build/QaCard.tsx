@@ -4,7 +4,9 @@ import { useEffect, useMemo, useState } from "react";
 import { clearQa, generateQa, loadQaPages, removeQa, stopQa } from "@/lib/sync";
 import { fmtCount } from "@/lib/format";
 import { useStudio } from "@/lib/store";
-import type { QaPageList } from "@/lib/types";
+import type { DataStyle, QaPageList } from "@/lib/types";
+import { DatasetIO } from "./DatasetIO";
+import { StyleField } from "./StyleField";
 import { Badge, Button, Card, Field, NumberInput, SectionHeader, SelectInput, cn } from "../ui/kit";
 
 /** "1-5, 9, 12-14" -> the page numbers in it that exist. */
@@ -21,6 +23,9 @@ function parseRanges(text: string, available: Set<number>): number[] {
 }
 
 export function QaCard() {
+  const [collapsed, setCollapsed] = useState(false);
+  const [style, setStyle] = useState<DataStyle>("simple");
+  const [system, setSystem] = useState("");
   const docs = useStudio((s) => s.docs);
   const qa = useStudio((s) => s.qa);
   const progress = useStudio((s) => s.qaProgress);
@@ -80,7 +85,7 @@ export function QaCard() {
 
   async function start() {
     setStartError("");
-    const err = await generateQa(currentId, [...picked].sort((a, b) => a - b), perPage, parallel);
+    const err = await generateQa(currentId, [...picked].sort((a, b) => a - b), perPage, parallel, style, system);
     if (err) setStartError(err);
   }
 
@@ -89,10 +94,12 @@ export function QaCard() {
       <SectionHeader
         title="Q&A dataset"
         sub="Have a language model write question-answer pairs from the pages you pick, then train on them from the Observe tab."
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((v) => !v)}
         icon={<MessageSquareText size={16} className="text-accent" />}
         right={total > 0 ? <Badge tone="accent">{total.toLocaleString()} pair{total === 1 ? "" : "s"}</Badge> : undefined}
       />
-      <div className="space-y-4 px-4 pb-4">
+      {!collapsed && <div className="space-y-4 px-4 pb-4">
         {ready.length === 0 ? (
           <p className="rounded-lg bg-surface-2 px-3 py-3 text-xs text-muted">Upload a document above (PDF, Word, PowerPoint, text…) and its pages will show up here.</p>
         ) : (
@@ -143,6 +150,8 @@ export function QaCard() {
                 {list.pages.length === 0 && <p className="text-xs text-warn">No {label}s with enough text to write questions about.</p>}
               </div>
             )}
+
+            <StyleField kind="qa" value={style} onChange={setStyle} system={system} onSystem={setSystem} disabled={running} />
 
             <div className="grid grid-cols-2 gap-3">
               <Field label="Questions per page" help="Pairs requested from the model for each selected page.">
@@ -204,7 +213,7 @@ export function QaCard() {
                     <div className="min-w-0 flex-1 text-xs leading-snug">
                       <div className="font-medium">{p.question}</div>
                       <div className="mt-0.5 text-muted">{p.answer}</div>
-                      <div className="mt-1 text-[10px] text-muted/80">{p.doc} · p. {p.page}</div>
+                      <div className="mt-1 text-[10px] text-muted/80">{p.doc}{p.page > 0 ? ` · p. ${p.page}` : ""}</div>
                     </div>
                     <button onClick={() => removeQa([p.id])} aria-label="Delete this pair" className="rounded p-1 text-muted opacity-0 hover:bg-surface-2 hover:text-danger focus:opacity-100 group-hover:opacity-100"><Trash2 size={13} /></button>
                   </li>
@@ -213,7 +222,9 @@ export function QaCard() {
             )}
           </div>
         )}
-      </div>
+
+        <DatasetIO kind="qa" count={total} busy={running} />
+      </div>}
     </Card>
   );
 }

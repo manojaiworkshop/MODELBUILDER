@@ -103,3 +103,201 @@ pub async fn upload(State(shared): State<Arc<Shared>>, Query(q): Query<UploadQue
     session.spawn_extraction(id.clone(), path, name);
     (StatusCode::OK, Json(json!({ "ok": true, "id": id, "size": written }))).into_response()
 }
+
+#[derive(Deserialize)]
+pub struct ImportQuery {
+    sid: String,
+    name: String,
+    kind: crate::hfdata::Kind,
+    style: crate::hfdata::Style,
+}
+
+/// `PUT /api/import?sid=&name=&kind=qa|summary&style=auto|hf|simple|chat` — a Hugging Face-style
+/// JSON / JSONL file whose records become Q&A pairs or summaries (see `hfdata`). Read into
+/// memory (capped by `MAX_IMPORT_BYTES`, 64 MiB): records are small and get parsed anyway.
+pub async fn import_dataset(State(shared): State<Arc<Shared>>, Query(q): Query<ImportQuery>, body: Body) -> Response {
+    use crate::hfdata::{self, Kind};
+    let Some(session) = shared.session(&q.sid) else {
+        return fail(StatusCode::NOT_FOUND, "Your session expired. Reload the page and try again.");
+    };
+    let limit: usize = std::env::var("MAX_IMPORT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(64 << 20);
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => b,
+        Err(_) => return fail(StatusCode::PAYLOAD_TOO_LARGE, format!("Dataset files can be at most {}.", mb(limit as u64))),
+    };
+    let parquet = crate::hfdata::is_parquet(&bytes);
+    let content = if parquet {
+        match tokio::task::spawn_blocking({ let b = bytes.clone(); move || crate::hfdata::parquet_to_jsonl(b) }).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return fail(StatusCode::UNPROCESSABLE_ENTITY, e),
+            Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Reading the Parquet file failed."),
+        }
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let name: String = q.name.rsplit(['/', '\\']).next().unwrap_or("import").chars().filter(|c| !c.is_control()).take(200).collect();
+    let doc_id = format!("import:{name}");
+    let (kind, style) = (q.kind, q.style);
+
+    let parsed = tokio::task::spawn_blocking(move || match kind {
+        Kind::Qa => hfdata::import_qa(&content, style).map(|i| (i.skipped, Ok(i.items), Err(()))),
+        Kind::Summary => hfdata::import_summaries(&content, style).map(|i| (i.skipped, Err(()), Ok(i.items))),
+    })
+    .await;
+    let (skipped, qa_items, sum_items) = match parsed {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return fail(StatusCode::UNPROCESSABLE_ENTITY, e),
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Reading the file failed."),
+    };
+
+    let mut added = 0usize;
+    let mut capped = false;
+    {
+        let mut d = session.data.lock().await;
+        if let Ok(items) = qa_items {
+            for (style, (ctx, question, answer, system)) in items {
+                if d.qa.len() >= crate::qa::MAX_PAIRS {
+                    capped = true;
+                    break;
+                }
+                let id = d.new_qa_id();
+                d.qa.push(crate::qa::QaPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, question, answer, context: ctx.into() });
+                added += 1;
+            }
+        } else if let Ok(items) = sum_items {
+            for (style, (text, summary, system)) in items {
+                if d.summaries.len() >= crate::summarize::MAX_PAIRS {
+                    capped = true;
+                    break;
+                }
+                let id = d.new_summary_id();
+                d.summaries.push(crate::summarize::SummaryPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, text, summary });
+                added += 1;
+            }
+        }
+    }
+    match kind {
+        Kind::Qa => session.emit_qa_list().await,
+        Kind::Summary => session.emit_summary_list().await,
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "added": added, "skipped": skipped, "capped": capped }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    sid: String,
+    kind: crate::hfdata::Kind,
+    style: crate::hfdata::Style,
+    #[serde(default)]
+    format: crate::hfdata::FileFormat,
+    /// Chat style: system prompt for pairs that don't have their own.
+    #[serde(default)]
+    system: String,
+}
+
+/// `GET /api/export?sid=&kind=qa|summary&style=hf|simple|instruction|chat&format=jsonl|parquet` —
+/// the current dataset as a downloadable file (see `hfdata`).
+pub async fn export_dataset(State(shared): State<Arc<Shared>>, Query(q): Query<ExportQuery>) -> Response {
+    use crate::hfdata::{self, FileFormat, Kind};
+    let Some(session) = shared.session(&q.sid) else {
+        return fail(StatusCode::NOT_FOUND, "Your session expired. Reload the page and try again.");
+    };
+    let system: String = q.system.trim().chars().take(2000).collect();
+    let (jsonl, count, prefix) = {
+        let d = session.data.lock().await;
+        match q.kind {
+            Kind::Qa => (hfdata::export_qa(&d.qa, q.style, &system), d.qa.len(), "qa"),
+            Kind::Summary => (hfdata::export_summaries(&d.summaries, q.style, &system), d.summaries.len(), "summary"),
+        }
+    };
+    if count == 0 {
+        return fail(StatusCode::NOT_FOUND, "There is nothing to export yet.");
+    }
+    let jsonl = match jsonl {
+        Ok(t) => t,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let format = q.format;
+    let body = match format {
+        FileFormat::Jsonl => Ok(jsonl.into_bytes()),
+        FileFormat::Parquet => match tokio::task::spawn_blocking(move || hfdata::jsonl_to_parquet(&jsonl)).await {
+            Ok(r) => r,
+            Err(_) => Err("Writing the Parquet file failed.".to_string()),
+        },
+    };
+    match body {
+        Ok(bytes) => {
+            let name = format!("{prefix}-{:?}.{}", q.style, format.extension()).to_lowercase();
+            let ctype = if format == FileFormat::Parquet { "application/vnd.apache.parquet" } else { "application/x-ndjson" };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, ctype.to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")), (header::HeaderName::from_static("x-filename"), name), (header::HeaderName::from_static("x-count"), count.to_string())],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ModelExportQuery {
+    sid: String,
+}
+
+/// `GET /api/model/export?sid=` — the most recently trained model as a Hugging Face-style folder
+/// (zipped), see `export`.
+pub async fn export_model(State(shared): State<Arc<Shared>>, Query(q): Query<ModelExportQuery>) -> Response {
+    let Some(session) = shared.session(&q.sid) else {
+        return fail(StatusCode::NOT_FOUND, "Your session expired. Reload the page and try again.");
+    };
+    let trained = session.trained.lock().unwrap().clone();
+    let Some(trained) = trained else {
+        return fail(StatusCode::NOT_FOUND, "There is no trained model yet. Press Run first.");
+    };
+    if trained.step == 0 {
+        return fail(StatusCode::CONFLICT, "The model hasn't been trained yet (step 0).");
+    }
+    match tokio::task::spawn_blocking(move || crate::export::bundle(&trained)).await {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/zip"), (header::CONTENT_DISPOSITION, "attachment; filename=\"modelbuilder-model.zip\"")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(_) => fail(StatusCode::INTERNAL_SERVER_ERROR, "Building the model bundle failed."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TokenizerQuery {
+    sid: String,
+    name: String,
+}
+
+/// `PUT /api/tokenizer?sid=&name=` — a Hugging Face `tokenizer.json` (raw body, up to
+/// `MAX_TOKENIZER_BYTES`, 128 MiB). It replaces the built-in BPE for every dataset the session
+/// builds (text, Q&A, summaries), and the dataset is rebuilt with it.
+pub async fn upload_tokenizer(State(shared): State<Arc<Shared>>, Query(q): Query<TokenizerQuery>, body: Body) -> Response {
+    let Some(session) = shared.session(&q.sid) else {
+        return fail(StatusCode::NOT_FOUND, "Your session expired. Reload the page and try again.");
+    };
+    let limit: usize = std::env::var("MAX_TOKENIZER_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(128 << 20);
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => b.to_vec(),
+        Err(_) => return fail(StatusCode::PAYLOAD_TOO_LARGE, format!("A tokenizer.json can be at most {}.", mb(limit as u64))),
+    };
+    let name: String = q.name.rsplit(['/', '\\']).next().unwrap_or("tokenizer.json").chars().filter(|c| !c.is_control()).take(200).collect();
+    let parsed = tokio::task::spawn_blocking(move || crate::tokenizer::ImportedTok::parse(&name, bytes)).await;
+    let tok = match parsed {
+        Ok(Ok(t)) => std::sync::Arc::new(t),
+        Ok(Err(e)) => return fail(StatusCode::UNPROCESSABLE_ENTITY, e),
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Reading the tokenizer failed."),
+    };
+    let reply = json!({ "ok": true, "name": tok.name, "model": tok.model, "fullVocab": tok.full_vocab });
+    session.data.lock().await.custom_tok = Some(tok);
+    session.emit_tokenizer().await;
+    session.schedule_rebuild();
+    (StatusCode::OK, Json(reply)).into_response()
+}

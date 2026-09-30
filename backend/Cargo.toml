@@ -27,6 +27,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # CPU-only training engine: tensors + autograd, pure Rust.
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
+arrow-json = "60.0.0"
+arrow-schema = "60.0.0"
+bytes = "1.12.1"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 
 [profile.dev]
 opt-level = 3        # tensor math is unusably slow unoptimized

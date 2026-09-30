@@ -126,12 +126,24 @@ export interface InspectPayload {
   probeLoss: number | null;
   map: MapPoint[];
 }
+/** Which tokenizer the dataset is built with: the built-in BPE, or an imported Hugging Face tokenizer.json. */
+export interface TokenizerInfo {
+  kind: "default" | "imported";
+  /** File name of the imported tokenizer.json. */
+  name: string;
+  /** "BPE", "Unigram", "WordPiece" or "WordLevel". */
+  model: string;
+  /** Ids the imported tokenizer defines. */
+  fullVocab: number;
+}
 export interface DataInfo {
   ok: boolean;
   error: string | null;
   chars: number;
   tokens: number;
+  /** Model vocabulary: for an imported tokenizer, the ids the data uses (out of `fullVocab`). */
   vocabSize: number;
+  fullVocab: number;
   merges: number;
   compression: number;
   preview: TokenInfo[];
@@ -172,13 +184,21 @@ export interface UploadItem {
 }
 // ------------------------------------------------------------- Q&A dataset
 
+/** How a dataset is written: LLM output style, training layout and file schema. */
+export type DataStyle = "hf" | "simple" | "instruction" | "chat";
+
 export interface QaPair {
   id: number;
   docId: string;
   doc: string;
   page: number;
+  style: DataStyle;
+  /** System prompt (chat style), empty when none. */
+  system: string;
   question: string;
   answer: string;
+  /** First ~300 characters of the page the pair came from (empty for imports without context). */
+  contextHead: string;
 }
 export interface QaPageInfo {
   n: number;
@@ -199,8 +219,29 @@ export interface QaProgress {
   failed: number;
   message: string;
 }
+// ------------------------------------------------------------ summary dataset
+
+export interface SummaryPair {
+  id: number;
+  docId: string;
+  doc: string;
+  page: number;
+  style: DataStyle;
+  system: string;
+  /** The page text the summary was written from (same clipped text the model saw). */
+  text: string;
+  summary: string;
+}
+export interface SummaryProgress {
+  state: "running" | "done" | "stopped" | "error";
+  done: number;
+  total: number;
+  summaries: number;
+  failed: number;
+  message: string;
+}
 /** What a training run learns from, and whether it starts from scratch. */
-export type TrainSource = "text" | "qa";
+export type TrainSource = "text" | "qa" | "summary";
 export type TrainMode = "new" | "continue";
 
 export type RunState = "idle" | "preparing" | "running" | "stopped" | "done" | "error";

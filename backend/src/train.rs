@@ -34,12 +34,37 @@ pub enum Event {
 /// The most recent weights of a run, kept so the user can inspect and generate after (or during) training.
 pub struct Trained {
     pub model: Model<IB>,
+    pub spec: ModelSpec,
+    pub hyper: crate::events::Hyper,
+    pub provenance: Provenance,
+    /// Latest training / validation loss, updated as the run goes on (shared by every snapshot).
+    pub metrics: Arc<Mutex<Metrics>>,
     pub fingerprint: u64,
     pub seq_len: usize,
     pub step: usize,
     pub tok: Arc<Tokenized>,
-    /// Trained on the Q&A dataset (its vocabulary is its own, not the Data tab's).
-    pub qa: bool,
+    /// Trained on the Q&A or summary dataset (its vocabulary is its own, built from that
+    /// generated text, not the Data tab's).
+    pub own_vocab: bool,
+}
+
+/// What a model was trained on (for the exported model card and chat template).
+#[derive(Debug, Clone, Default)]
+pub struct Provenance {
+    /// "text", "qa" or "summary".
+    pub source: String,
+    /// Styles of the pairs (empty for plain text).
+    pub styles: Vec<crate::hfdata::Style>,
+    /// Chat system prompt(s) used, if any.
+    pub system: String,
+    /// Pairs / summaries, or characters of text.
+    pub examples: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Metrics {
+    pub train_loss: Option<f32>,
+    pub val_loss: Option<f32>,
 }
 
 /// Marks every float parameter as requiring gradients. Weights that come from `from_inner` are
@@ -65,7 +90,8 @@ pub struct Job {
     pub trained: TrainedSlot,
     /// Weights to keep training from (`None` = fresh random initialisation).
     pub init: Option<Model<IB>>,
-    pub qa: bool,
+    pub own_vocab: bool,
+    pub provenance: Provenance,
 }
 
 fn lr_at(step: usize, total: usize, base: f64, warmup: usize) -> f64 {
@@ -95,7 +121,7 @@ fn r4(x: f32) -> f32 {
 }
 
 pub fn run(job: Job) {
-    let Job { spec, tok, hyper: h, probe, cancel, tx, trained, init, qa } = job;
+    let Job { spec, tok, hyper: h, probe, cancel, tx, trained, init, own_vocab, provenance } = job;
     let status = |state: &'static str, message: String, step: usize| {
         let _ = tx.send(Event::Status(StatusPayload { state, message, step, total: h.steps }));
     };
@@ -135,6 +161,7 @@ pub fn run(job: Job) {
     let mut rng = StdRng::seed_from_u64(h.seed);
     let fingerprint = spec.fingerprint();
 
+    let metrics = Arc::new(Mutex::new(Metrics::default()));
     let mut pending: Vec<StepPoint> = Vec::new();
     let mut last_flush = Instant::now();
     let mut norms: Vec<(usize, f32, f32)> = Vec::new();
@@ -149,7 +176,7 @@ pub fn run(job: Job) {
             }
         }
         let _ = tx.send(Event::Inspect(Box::new(payload)));
-        *trained.lock().unwrap() = Some(Arc::new(Trained { model: m.clone(), fingerprint, seq_len: h.seq_len, step, tok: tok.clone(), qa }));
+        *trained.lock().unwrap() = Some(Arc::new(Trained { model: m.clone(), spec: spec.clone(), hyper: h.clone(), provenance: provenance.clone(), metrics: metrics.clone(), fingerprint, seq_len: h.seq_len, step, tok: tok.clone(), own_vocab }));
     };
 
     let eval = |m: &Model<IB>, step: usize| {
@@ -165,6 +192,7 @@ pub fn run(job: Job) {
             total += loss_fn.forward(logits.reshape([b * s, v]), y.reshape([b * s])).into_scalar().elem::<f32>();
         }
         let vl = total / batches as f32;
+        metrics.lock().unwrap().val_loss = Some(r4(vl));
         let _ = tx.send(Event::Eval(EvalPoint { step, val_loss: r4(vl), perplexity: r4(vl.exp().min(1e6)) }));
     };
 
@@ -204,6 +232,7 @@ pub fn run(job: Job) {
         }
         model = optim.step(lr, model, grads);
         done_steps = step;
+        metrics.lock().unwrap().train_loss = Some(r4(loss_v));
 
         let dt = t0.elapsed().as_secs_f32().max(1e-6);
         pending.push(StepPoint { step, loss: r4(loss_v), lr: lr as f32, tok_per_sec: (b * s) as f32 / dt });
@@ -242,18 +271,21 @@ pub fn run(job: Job) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::events::Hyper;
 
-    fn run_job(spec_json: &str, steps: usize) -> (Vec<Event>, TrainedSlot) {
-        let spec: ModelSpec = serde_json::from_str(spec_json).unwrap();
+    pub(crate) fn run_job(spec_json: &str, steps: usize) -> (Vec<Event>, TrainedSlot) {
         let text = "the quick brown fox jumps over the lazy dog. ".repeat(80);
-        let tok = Arc::new(Tokenized::from_text(&text, 20));
+        run_job_tok(spec_json, steps, Arc::new(Tokenized::from_text(&text, 20)))
+    }
+
+    pub(crate) fn run_job_tok(spec_json: &str, steps: usize, tok: Arc<Tokenized>) -> (Vec<Event>, TrainedSlot) {
+        let spec: ModelSpec = serde_json::from_str(spec_json).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trained: TrainedSlot = Arc::new(Mutex::new(None));
         let hyper = Hyper { steps, batch_size: 8, seq_len: 32, lr: 5e-3, probe_every: 10, eval_every: 20, sample_every: 20, sample_tokens: 20, ..Default::default() };
-        run(Job { spec, tok, hyper, probe: Arc::new(Mutex::new("the quick brown".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: trained.clone(), init: None, qa: false });
+        run(Job { spec, tok, hyper, probe: Arc::new(Mutex::new("the quick brown".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: trained.clone(), init: None, own_vocab: false, provenance: Provenance::default() });
         let mut evs = Vec::new();
         while let Ok(e) = rx.try_recv() {
             evs.push(e);
@@ -261,7 +293,7 @@ mod tests {
         (evs, trained)
     }
 
-    const GEMMA: &str = r#"{"blocks":[
+    pub(crate) const GEMMA: &str = r#"{"blocks":[
         {"id":"e","type":"embedding","d_model":48},
         {"id":"a","type":"attention","n_heads":4,"n_kv_heads":2},
         {"id":"f","type":"ffn","kind":"glu","d_ff":96},
@@ -304,7 +336,7 @@ mod tests {
         let hyper = Hyper { steps: 10, batch_size: 8, seq_len: 32, lr: 1e-4, warmup_steps: 0, probe_every: 5, eval_every: 5, sample_every: 100, sample_tokens: 0, ..Default::default() };
         run(Job {
             spec, tok: t.tok.clone(), hyper, probe: Arc::new(Mutex::new("the quick".into())), cancel: Arc::new(AtomicBool::new(false)), tx,
-            trained: Arc::new(Mutex::new(None)), init: Some(t.model.clone()), qa: true,
+            trained: Arc::new(Mutex::new(None)), init: Some(t.model.clone()), own_vocab: true, provenance: Provenance::default(),
         });
         let mut first_loss = None;
         while let Ok(e) = rx.try_recv() {
@@ -325,7 +357,7 @@ mod tests {
         let other = Arc::new(Tokenized::from_parts(t.tok.bpe.clone(), t.tok.bpe.encode(&"pack my box with five dozen liquor jugs. ".repeat(60)).into_iter().map(|i| i as u16).collect(), 10, 10, vec![1; t.tok.bpe.vocab_size()], false));
         let hyper = Hyper { steps: 40, batch_size: 8, seq_len: 32, lr: 5e-3, warmup_steps: 0, probe_every: 10, eval_every: 100, sample_every: 100, sample_tokens: 0, ..Default::default() };
         let cont = Arc::new(Mutex::new(None));
-        run(Job { spec, tok: other, hyper, probe: Arc::new(Mutex::new("pack".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: cont.clone(), init: Some(t.model.clone()), qa: true });
+        run(Job { spec, tok: other, hyper, probe: Arc::new(Mutex::new("pack".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: cont.clone(), init: Some(t.model.clone()), own_vocab: true, provenance: Provenance::default() });
         let mut losses = vec![];
         let mut grads = vec![];
         while let Ok(e) = rx.try_recv() {

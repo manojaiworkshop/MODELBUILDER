@@ -6,10 +6,13 @@
 //!             -> `data:info`. Progress is pushed as `data:progress`; the document list as `data:docs`.
 
 use crate::corpus;
-use crate::events::{DataInfo, TokenInfo};
+use crate::events::{DataInfo, TokenInfo, TokenizerInfo};
 use crate::extract::{self, Kind};
 use crate::learn::LlmConfig;
+use crate::hfdata::Style;
+use crate::tokenizer::ImportedTok;
 use crate::qa::{self, QaPair};
+use crate::summarize::{self, SummaryPair};
 use crate::tokenizer::Tokenized;
 use crate::train::TrainedSlot;
 use serde::Serialize;
@@ -27,6 +30,8 @@ pub struct QaJob {
     /// 1-based page (section) numbers.
     pub pages: Vec<usize>,
     pub per_page: usize,
+    pub style: Style,
+    pub system: String,
     pub concurrency: usize,
 }
 
@@ -41,6 +46,28 @@ struct QaProgress {
     message: String,
 }
 
+/// A request to generate summaries from some pages of one document.
+pub struct SummarizeJob {
+    pub llm: LlmConfig,
+    /// 1-based page (section) numbers.
+    pub pages: Vec<usize>,
+    pub sentences: usize,
+    pub style: Style,
+    pub system: String,
+    pub concurrency: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummarizeProgress {
+    state: &'static str,
+    done: usize,
+    total: usize,
+    summaries: usize,
+    failed: usize,
+    message: String,
+}
+
 /// Process-wide limits and registries. All sizes are overridable by environment variables.
 pub struct Shared {
     pub trainings: Arc<Semaphore>,
@@ -48,7 +75,7 @@ pub struct Shared {
     pub builds: Arc<Semaphore>,
     /// Concurrent Learn-tab chat requests (each is an outbound HTTP call to a user-configured server).
     pub learns: Arc<Semaphore>,
-    /// Concurrent Q&A-generation model calls across all sessions.
+    /// Concurrent dataset-generation model calls (Q&A and summaries share one budget) across all sessions.
     pub qa_calls: Arc<Semaphore>,
     /// Shared, connection-pooling client for talking to that server.
     pub http: reqwest::Client,
@@ -154,11 +181,16 @@ pub struct DataState {
     pub pasted: String,
     pub use_pasted: bool,
     pub merges: usize,
+    /// An imported tokenizer.json, used instead of learning the built-in BPE (see `tokenizer::ImportedTok`).
+    pub custom_tok: Option<Arc<ImportedTok>>,
     pub tok: Option<Arc<Tokenized>>,
     /// Generated question-answer pairs (see qa.rs).
     pub qa: Vec<QaPair>,
+    /// Generated summaries (see summarize.rs).
+    pub summaries: Vec<SummaryPair>,
     next_id: u32,
     next_qa_id: u32,
+    next_summary_id: u32,
 }
 
 impl DataState {
@@ -170,6 +202,11 @@ impl DataState {
     pub fn new_qa_id(&mut self) -> u32 {
         self.next_qa_id += 1;
         self.next_qa_id
+    }
+
+    pub fn new_summary_id(&mut self) -> u32 {
+        self.next_summary_id += 1;
+        self.next_summary_id
     }
 }
 
@@ -184,6 +221,7 @@ pub struct Session {
     pub train_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub gen_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub qa_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub summarize_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// Bumped on every change that needs a new dataset; a rebuild only finishes if it is still current.
     pub gen: AtomicU64,
     build_cancel: Mutex<Arc<AtomicBool>>,
@@ -208,6 +246,7 @@ impl Session {
             train_cancel: Mutex::new(None),
             gen_cancel: Mutex::new(None),
             qa_cancel: Mutex::new(None),
+            summarize_cancel: Mutex::new(None),
             gen: AtomicU64::new(0),
             build_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             disk_used: AtomicU64::new(0),
@@ -218,7 +257,7 @@ impl Session {
 
     /// Stop everything and delete this session's files.
     pub fn close(&self) {
-        for slot in [&self.train_cancel, &self.gen_cancel, &self.qa_cancel] {
+        for slot in [&self.train_cancel, &self.gen_cancel, &self.qa_cancel, &self.summarize_cancel] {
             if let Some(c) = slot.lock().unwrap().as_ref() {
                 c.store(true, Ordering::Relaxed);
             }
@@ -256,6 +295,15 @@ impl Session {
 
     pub fn emit_info(&self, info: &DataInfo) {
         let _ = self.socket.emit("data:info", info);
+    }
+
+    /// Tells the browser which tokenizer the dataset is (about to be) built with.
+    pub async fn emit_tokenizer(&self) {
+        let info = match &self.data.lock().await.custom_tok {
+            Some(t) => TokenizerInfo { kind: "imported", name: t.name.clone(), model: t.model.clone(), full_vocab: t.full_vocab },
+            None => TokenizerInfo { kind: "default", name: String::new(), model: String::new(), full_vocab: 0 },
+        };
+        let _ = self.socket.emit("data:tokenizer", &info);
     }
 
     /// Extract a freshly uploaded file, then rebuild the dataset.
@@ -332,10 +380,11 @@ impl Session {
             emit("running", 0, 0, 0, String::new());
 
             let local = Arc::new(Semaphore::new(job.concurrency.max(1)));
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<Vec<(String, String)>, String>)>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<(std::sync::Arc<str>, Vec<(String, String)>), String>)>();
             for &n in &job.pages {
                 let (local, global, client, llm, cancel, tx) = (local.clone(), s.shared.qa_calls.clone(), s.shared.http.clone(), job.llm.clone(), cancel.clone(), tx.clone());
                 let (ranges, path, name, per_page) = (ranges.clone(), path.clone(), doc.name.clone(), job.per_page);
+                let style = job.style;
                 tokio::spawn(async move {
                     let Ok(_l) = local.acquire_owned().await else { return };
                     let Ok(_g) = global.acquire_owned().await else { return };
@@ -348,7 +397,7 @@ impl Session {
                         Some(&(a, b)) => match qa::read_range(&path, a, b) {
                             Err(e) => Err(format!("could not read page {n}: {e}")),
                             Ok(text) if text.chars().count() < qa::MIN_PAGE_CHARS => Err(format!("page {n} has almost no text")),
-                            Ok(text) => qa::generate_page(&client, &llm, &name, n, &text, per_page).await,
+                            Ok(text) => qa::generate_page(&client, &llm, &name, n, &text, per_page, style).await.map(|pairs| (std::sync::Arc::<str>::from(text.chars().take(qa::MAX_PAGE_CHARS).collect::<String>()), pairs)),
                         },
                     };
                     let _ = tx.send((n, res));
@@ -361,16 +410,16 @@ impl Session {
             let mut fatal = false;
             while let Some((n, res)) = rx.recv().await {
                 match res {
-                    Ok(list) => {
+                    Ok((context, list)) => {
                         let mut added = Vec::new();
                         {
                             let mut d = s.data.lock().await;
                             for (question, answer) in list {
                                 let key = question.to_lowercase();
-                                if d.qa.len() >= qa::MAX_PAIRS || d.qa.iter().any(|p| p.doc_id == doc.id && p.question.to_lowercase() == key) {
+                                if d.qa.len() >= qa::MAX_PAIRS || d.qa.iter().any(|p| p.doc_id == doc.id && p.style == job.style && p.question.to_lowercase() == key) {
                                     continue;
                                 }
-                                let p = QaPair { id: d.new_qa_id(), doc_id: doc.id.clone(), doc: doc.name.clone(), page: n, question, answer };
+                                let p = QaPair { id: d.new_qa_id(), doc_id: doc.id.clone(), doc: doc.name.clone(), page: n, style: job.style, system: job.system.clone(), question, answer, context: context.clone() };
                                 d.qa.push(p.clone());
                                 added.push(p);
                             }
@@ -404,6 +453,113 @@ impl Session {
         });
     }
 
+    pub async fn emit_summary_list(&self) {
+        let d = self.data.lock().await;
+        let _ = self.socket.emit("summarize:list", &d.summaries);
+    }
+
+    /// Generate summaries for the chosen pages: one model request per page, up to
+    /// `job.concurrency` at once (and never more than the server-wide limit). Progress is pushed
+    /// as `summarize:progress`; new summaries as `summarize:added`. Cancelled through `cancel`.
+    /// Re-summarizing a page replaces its earlier summary rather than adding another.
+    pub fn spawn_summarize(self: &Arc<Self>, job: SummarizeJob, cancel: Arc<AtomicBool>, doc: Doc) {
+        let s = self.clone();
+        tokio::spawn(async move {
+            let total = job.pages.len();
+            let emit = |state: &'static str, done: usize, summaries: usize, failed: usize, message: String| {
+                let _ = s.socket.emit("summarize:progress", &SummarizeProgress { state, done, total, summaries, failed, message });
+            };
+            let (Some(path), total_bytes) = (doc.text_path.clone(), doc.text_bytes) else {
+                emit("error", 0, 0, 0, "That document has no readable text.".into());
+                *s.summarize_cancel.lock().unwrap() = None;
+                return;
+            };
+            let ranges = match qa::page_ranges(&path, &doc.pages, total_bytes) {
+                Ok((r, _)) => Arc::new(r),
+                Err(e) => {
+                    emit("error", 0, 0, 0, format!("Could not read the document: {e}"));
+                    *s.summarize_cancel.lock().unwrap() = None;
+                    return;
+                }
+            };
+            emit("running", 0, 0, 0, String::new());
+
+            let local = Arc::new(Semaphore::new(job.concurrency.max(1)));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<(String, String), String>)>();
+            for &n in &job.pages {
+                let (local, global, client, llm, cancel, tx) = (local.clone(), s.shared.qa_calls.clone(), s.shared.http.clone(), job.llm.clone(), cancel.clone(), tx.clone());
+                let (ranges, path, name, sentences) = (ranges.clone(), path.clone(), doc.name.clone(), job.sentences);
+                let style = job.style;
+                tokio::spawn(async move {
+                    let Ok(_l) = local.acquire_owned().await else { return };
+                    let Ok(_g) = global.acquire_owned().await else { return };
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send((n, Err("cancelled".into())));
+                        return;
+                    }
+                    let res = match ranges.get(n.wrapping_sub(1)) {
+                        None => Err(format!("page {n} does not exist")),
+                        Some(&(a, b)) => match qa::read_range(&path, a, b) {
+                            Err(e) => Err(format!("could not read page {n}: {e}")),
+                            Ok(text) if text.chars().count() < qa::MIN_PAGE_CHARS => Err(format!("page {n} has almost no text")),
+                            Ok(text) => summarize::generate_page(&client, &llm, &name, n, &text, sentences, style).await,
+                        },
+                    };
+                    let _ = tx.send((n, res));
+                });
+            }
+            drop(tx);
+
+            let (mut done, mut made, mut failed) = (0usize, 0usize, 0usize);
+            let mut first_err: Option<String> = None;
+            let mut fatal = false;
+            while let Some((n, res)) = rx.recv().await {
+                match res {
+                    Ok((text, summary)) => {
+                        let added = {
+                            let mut d = s.data.lock().await;
+                            if d.summaries.len() >= summarize::MAX_PAIRS {
+                                None
+                            } else {
+                                d.summaries.retain(|p| !(p.doc_id == doc.id && p.page == n && p.style == job.style));
+                                let p = SummaryPair { id: d.new_summary_id(), doc_id: doc.id.clone(), doc: doc.name.clone(), page: n, style: job.style, system: job.system.clone(), text, summary };
+                                d.summaries.push(p.clone());
+                                Some(p)
+                            }
+                        };
+                        if let Some(p) = added {
+                            made += 1;
+                            // a fixed-size array here would be encoded as a bare (spread) arg, not
+                            // a one-element JSON array (socketioxide treats compile-time-length
+                            // sequences as tuple-like) — a Vec always stays wrapped as one array.
+                            let _ = s.socket.emit("summarize:added", &vec![p]);
+                        }
+                    }
+                    Err(e) if e == "cancelled" => {}
+                    Err(e) => {
+                        failed += 1;
+                        if e.contains("API key") || e.contains("Settings") || e.contains("(404)") {
+                            fatal = true;
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        first_err.get_or_insert(format!("page {n}: {e}"));
+                    }
+                }
+                done += 1;
+                emit("running", done, made, failed, first_err.clone().unwrap_or_default());
+            }
+            let stopped = cancel.load(Ordering::Relaxed) && !fatal;
+            {
+                let mut d = s.data.lock().await;
+                d.summaries.sort_by(|a, b| (&a.doc_id, a.page, a.id).cmp(&(&b.doc_id, b.page, b.id)));
+            }
+            s.emit_summary_list().await;
+            *s.summarize_cancel.lock().unwrap() = None;
+            let state = if fatal { "error" } else if stopped { "stopped" } else { "done" };
+            emit(state, done, made, failed, first_err.unwrap_or_default());
+        });
+    }
+
     /// (Re)build the tokenized dataset from the current sources. Debounced, and supersedes any
     /// build already running. Waits while documents are still being extracted (their completion
     /// calls this again).
@@ -417,7 +573,7 @@ impl Session {
             if s.gen.load(Ordering::SeqCst) != my {
                 return;
             }
-            let (files, merges) = {
+            let (files, merges, custom) = {
                 let d = s.data.lock().await;
                 if d.docs.iter().any(|x| x.state == DocState::Extracting) {
                     return;
@@ -430,7 +586,7 @@ impl Session {
                     }
                 }
                 files.extend(d.docs.iter().filter(|x| x.enabled && x.state == DocState::Ready).filter_map(|x| x.text_path.clone()));
-                (files, d.merges)
+                (files, d.merges, d.custom_tok.clone())
             };
             let sources = files.len();
             if files.is_empty() {
@@ -446,7 +602,7 @@ impl Session {
             let started = Instant::now();
             s.progress("tokenizer", 0.0, "Preparing…".into());
             let (sock, last) = (s.socket.clone(), AtomicU32::new(u32::MAX));
-            let cfg = corpus::Cfg { merges, max_tokens: s.shared.max_tokens, ..Default::default() };
+            let cfg = corpus::Cfg { merges, max_tokens: s.shared.max_tokens, custom, ..Default::default() };
             let res = tokio::task::spawn_blocking(move || {
                 let report = |stage: &'static str, pct: f32, message: String| {
                     // at most one event per percent
@@ -484,6 +640,7 @@ pub fn data_info(tok: &Tokenized, merges: usize, sources: usize, took: Duration)
         chars: tok.chars,
         tokens: tok.ids.len(),
         vocab_size: tok.bpe.vocab_size(),
+        full_vocab: tok.bpe.imported().map(|c| c.tok.full_vocab).unwrap_or(0),
         merges: tok.bpe.n_merges().min(merges),
         compression: if tok.ids.is_empty() { 0.0 } else { tok.chars as f32 / tok.ids.len() as f32 },
         preview: tok.ids.iter().take(48).map(|&id| TokenInfo { id: id as u32, text: tok.bpe.token_text(id as u32) }).collect(),

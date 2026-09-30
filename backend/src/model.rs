@@ -508,6 +508,97 @@ impl<B: Backend> Model<B> {
     }
 }
 
+/// One weight tensor with a Hugging Face-style name: `(name, shape, row-major f32 data)`.
+pub type NamedTensor = (String, Vec<usize>, Vec<f32>);
+
+fn push_vec<B: Backend>(out: &mut Vec<NamedTensor>, name: String, t: &Param<Tensor<B, 1>>) {
+    let t = t.val();
+    out.push((name, t.dims().to_vec(), to_vec(t)));
+}
+
+/// `nn.Linear` layout: `[out, in]` (burn stores `[in, out]`, so it is transposed).
+fn push_linear<B: Backend>(out: &mut Vec<NamedTensor>, name: String, l: &Linear<B>) {
+    let w = l.weight.val().transpose();
+    out.push((format!("{name}.weight"), w.dims().to_vec(), to_vec(w)));
+    if let Some(b) = &l.bias {
+        push_vec::<B>(out, format!("{name}.bias"), b);
+    }
+}
+
+fn push_norm<B: Backend>(out: &mut Vec<NamedTensor>, name: &str, n: &Option<NormAny<B>>) {
+    let Some(n) = n else { return };
+    if let Some(r) = &n.rms {
+        push_vec::<B>(out, format!("{name}.weight"), &r.gamma);
+    }
+    if let Some(l) = &n.layer {
+        push_vec::<B>(out, format!("{name}.weight"), &l.gamma);
+        if let Some(b) = &l.beta {
+            push_vec::<B>(out, format!("{name}.bias"), b);
+        }
+    }
+}
+
+fn push_glu<B: Backend>(out: &mut Vec<NamedTensor>, name: &str, g: &Glu<B>) {
+    push_linear(out, format!("{name}.gate_proj"), &g.gate);
+    push_linear(out, format!("{name}.up_proj"), &g.up);
+    push_linear(out, format!("{name}.down_proj"), &g.down);
+}
+
+impl<B: Backend> Model<B> {
+    /// Every learned weight, named like a Hugging Face checkpoint: `model.embed_tokens.weight`,
+    /// `model.blocks.{stack index}.self_attn.q_proj.weight`, `…mlp.experts.{e}.gate_proj.weight`,
+    /// `lm_head.weight` (only when the head is not tied). Sinusoidal positions and RoPE are computed,
+    /// not learned, so they have no tensors.
+    pub fn named_tensors(&self) -> Vec<NamedTensor> {
+        let mut out = Vec::new();
+        let w = self.embed.weight.val();
+        out.push(("model.embed_tokens.weight".to_string(), w.dims().to_vec(), to_vec(w)));
+        for placed in &self.layers {
+            let p = format!("model.blocks.{}", placed.index);
+            match &placed.layer {
+                Layer::Pos(_) | Layer::Drop(_) => {}
+                Layer::Norm(n) => push_norm(&mut out, &format!("{p}.norm"), &Some(n.clone())),
+                Layer::Attn(a) => {
+                    push_norm(&mut out, &format!("{p}.input_norm"), &a.norm);
+                    push_linear(&mut out, format!("{p}.self_attn.q_proj"), &a.wq);
+                    push_linear(&mut out, format!("{p}.self_attn.k_proj"), &a.wk);
+                    push_linear(&mut out, format!("{p}.self_attn.v_proj"), &a.wv);
+                    push_linear(&mut out, format!("{p}.self_attn.o_proj"), &a.wo);
+                    if let Some(n) = &a.q_norm {
+                        push_vec::<B>(&mut out, format!("{p}.self_attn.q_norm.weight"), &n.gamma);
+                    }
+                    if let Some(n) = &a.k_norm {
+                        push_vec::<B>(&mut out, format!("{p}.self_attn.k_norm.weight"), &n.gamma);
+                    }
+                    if let Some(s) = &a.sink {
+                        push_vec::<B>(&mut out, format!("{p}.self_attn.sinks"), s);
+                    }
+                }
+                Layer::Ffn(f) => {
+                    push_norm(&mut out, &format!("{p}.input_norm"), &f.norm);
+                    match &f.inner {
+                        FfnInner::Glu(g) => push_glu(&mut out, &format!("{p}.mlp"), g),
+                        FfnInner::Mlp(m) => {
+                            push_linear(&mut out, format!("{p}.mlp.up_proj"), &m.up);
+                            push_linear(&mut out, format!("{p}.mlp.down_proj"), &m.down);
+                        }
+                        FfnInner::Moe(m) => {
+                            push_linear(&mut out, format!("{p}.mlp.router"), &m.router);
+                            for (e, g) in m.experts.iter().enumerate() {
+                                push_glu(&mut out, &format!("{p}.mlp.experts.{e}"), g);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(h) = &self.head {
+            push_linear(&mut out, "lm_head".to_string(), h);
+        }
+        out
+    }
+}
+
 impl<B: Backend> Placed<B> {
     fn layer_params(&self) -> usize {
         self.layer.num_params()

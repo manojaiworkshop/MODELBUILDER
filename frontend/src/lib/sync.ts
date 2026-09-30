@@ -1,9 +1,9 @@
 "use client";
 import { useEffect, useRef } from "react";
-import { call, getSocket } from "./backend";
-import { isRunning, useStudio } from "./store";
+import { backendUrl, call, getSocket } from "./backend";
+import { DEFAULT_TOKENIZER, isRunning, useStudio } from "./store";
 import { blockLabel, CATALOG } from "./blocks";
-import type { BuildProgress, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload, StatusPayload, StepPoint } from "./types";
+import type { BuildProgress, DataStyle, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload, StatusPayload, StepPoint, SummaryPair, SummaryProgress, TokenizerInfo } from "./types";
 
 /** Keeps the backend in step with the UI. Mount once. */
 export function useBackendSync() {
@@ -17,11 +17,14 @@ export function useBackendSync() {
       sentText.current = null; // new server session has no dataset
       st().setConn("connected");
       st().setDataInfo(null);
+      st().setTokenizer(DEFAULT_TOKENIZER); // the new server session starts with the built-in one
       st().setDocs([]);
       st().setProgress(null);
       st().setQa([]);
       st().setQaProgress(null);
-      if (st().trainSource === "qa") st().setTrainSource("text");
+      st().setSummaries([]);
+      st().setSummaryProgress(null);
+      if (st().trainSource === "qa" || st().trainSource === "summary") st().setTrainSource("text");
       if (st().trainMode === "continue") st().setTrainMode("new"); // the new session has no earlier weights
     };
     const onDisconnect = () => st().setConn("disconnected");
@@ -38,8 +41,12 @@ export function useBackendSync() {
     const onQaList = (p: QaPair[]) => st().setQa(p);
     const onQaAdded = (p: QaPair[]) => st().addQa(p);
     const onQaProgress = (p: QaProgress) => st().setQaProgress(p);
+    const onSummaryList = (p: SummaryPair[]) => st().setSummaries(p);
+    const onSummaryAdded = (p: SummaryPair[]) => st().addSummaries(p);
+    const onSummaryProgress = (p: SummaryProgress) => st().setSummaryProgress(p);
     const onDocs = (p: { docs: DocInfo[] }) => st().setDocs(p.docs);
     const onProgress = (p: BuildProgress) => st().setProgress(p.stage === "done" ? null : p);
+    const onTokenizer = (p: TokenizerInfo) => st().setTokenizer(p);
     const onInfo = (p: DataInfo) => {
       st().setProgress(null);
       st().setDataInfo(p.ok ? p : null);
@@ -49,6 +56,7 @@ export function useBackendSync() {
       } else st().setDataError(null);
     };
 
+    s.on("data:tokenizer", onTokenizer);
     s.on("connect", onConnect);
     s.on("disconnect", onDisconnect);
     s.on("connect_error", onConnectError);
@@ -62,6 +70,9 @@ export function useBackendSync() {
     s.on("qa:list", onQaList);
     s.on("qa:added", onQaAdded);
     s.on("qa:progress", onQaProgress);
+    s.on("summarize:list", onSummaryList);
+    s.on("summarize:added", onSummaryAdded);
+    s.on("summarize:progress", onSummaryProgress);
     s.on("data:progress", onProgress);
     s.on("data:info", onInfo);
     if (s.connected) onConnect();
@@ -76,9 +87,13 @@ export function useBackendSync() {
       s.off("train:inspect", onInspect);
       s.off("generate:token", onToken);
       s.off("data:docs", onDocs);
+      s.off("data:tokenizer", onTokenizer);
       s.off("qa:list", onQaList);
       s.off("qa:added", onQaAdded);
       s.off("qa:progress", onQaProgress);
+      s.off("summarize:list", onSummaryList);
+      s.off("summarize:added", onSummaryAdded);
+      s.off("summarize:progress", onSummaryProgress);
       s.off("data:progress", onProgress);
       s.off("data:info", onInfo);
     };
@@ -152,22 +167,44 @@ export async function startTraining() {
   st.resetRun();
   st.setGen({ text: "", error: null });
   try {
-    // "continue" only makes sense for Q&A pairs and when there are weights to build on (the bar shows the same rule)
-    const mode = st.trainSource === "qa" && st.trainMode === "continue" && st.inspect?.trained ? "continue" : "new";
+    // "continue" only makes sense for Q&A pairs / summaries and when there are weights to build on (the bar shows the same rule)
+    const canContinue = st.trainSource === "qa" || st.trainSource === "summary";
+    const mode = canContinue && st.trainMode === "continue" && st.inspect?.trained ? "continue" : "new";
     let probe = st.probe;
-    if (st.trainSource === "qa") {
-      // sample from a prompt shaped like the training text, so the samples show what it learned
-      const q = st.qa[0]?.question;
-      if (q && !probe.startsWith("Question:")) {
-        probe = `Question: ${q}\nAnswer:`;
-        st.setProbe(probe);
-      }
+    // sample from a prompt shaped like the training text (in the first pair's style), so the samples show what it learned
+    const shaped = PROBE_PREFIXES.some((p) => probe.startsWith(p));
+    if (st.trainSource === "qa" && st.qa[0] && !shaped) {
+      probe = qaProbe(st.qa[0]);
+      st.setProbe(probe);
+    } else if (st.trainSource === "summary" && st.summaries[0] && !shaped) {
+      probe = summaryProbe(st.summaries[0]);
+      st.setProbe(probe);
     }
     const res = await call<{ ok: boolean; error?: string }>("train:start", { spec: { blocks: st.blocks }, hyper: st.hyper, probe, source: st.trainSource, mode });
     if (!res.ok) st.setStatus({ state: "error", message: res.error ?? "Could not start training", step: 0, total: 0 });
   } catch (e) {
     st.setStatus({ state: "error", message: (e as Error).message, step: 0, total: 0 });
   }
+}
+
+const PROBE_PREFIXES = ["Question:", "Context:", "Text:", "Article:", "### Instruction:", "<|system|>", "<|user|>"];
+
+const chatHead = (system: string) => (system ? `<|system|>\n${system}\n` : "");
+
+/** The start of a training block for this pair, in its style, ending where the answer begins. */
+function qaProbe(p: QaPair): string {
+  if (p.style === "hf" && p.contextHead) return `Context: ${p.contextHead}\nQuestion: ${p.question}\nAnswer:`;
+  if (p.style === "instruction") return `### Instruction:\n${p.question}\n\n${p.contextHead ? `### Input:\n${p.contextHead}\n\n` : ""}### Response:\n`;
+  if (p.style === "chat") return `${chatHead(p.system)}<|user|>\n${p.question}\n<|assistant|>\n`;
+  return `Question: ${p.question}\nAnswer:`;
+}
+
+function summaryProbe(p: SummaryPair): string {
+  const t = p.text.slice(0, 200);
+  if (p.style === "hf") return `Article: ${t}\nHighlights:`;
+  if (p.style === "instruction") return `### Instruction:\nSummarize the following text.\n\n### Input:\n${t}\n\n### Response:\n`;
+  if (p.style === "chat") return `${chatHead(p.system)}<|user|>\nSummarize the following text:\n\n${t}\n<|assistant|>\n`;
+  return `Text: ${t}\nSummary:`;
 }
 
 // ---- Q&A dataset ------------------------------------------------------------
@@ -182,11 +219,11 @@ export async function loadQaPages(docId: string): Promise<{ ok: true; list: QaPa
   }
 }
 
-export async function generateQa(docId: string, pages: number[], perPage: number, concurrency: number): Promise<string | null> {
+export async function generateQa(docId: string, pages: number[], perPage: number, concurrency: number, style: DataStyle, system: string): Promise<string | null> {
   const st = useStudio.getState();
   st.setQaProgress({ state: "running", done: 0, total: pages.length, pairs: 0, failed: 0, message: "" });
   try {
-    const res = await call<{ ok: boolean; error?: string }>("qa:generate", { llm: st.llm, id: docId, pages, perPage, concurrency });
+    const res = await call<{ ok: boolean; error?: string }>("qa:generate", { llm: st.llm, id: docId, pages, perPage, style, system, concurrency });
     if (!res.ok) {
       st.setQaProgress(null);
       return res.error ?? "Could not start generation.";
@@ -201,6 +238,106 @@ export async function generateQa(docId: string, pages: number[], perPage: number
 export const stopQa = () => call("qa:stop").catch(() => {});
 export const removeQa = (ids: number[]) => call("qa:remove", { ids }).catch(() => {});
 export const clearQa = () => call("qa:remove", { ids: [] }).catch(() => {});
+
+// ---- Summary dataset --------------------------------------------------------
+// Page listing is shared with Q&A (`loadQaPages` — it's just the document's page boundaries).
+
+export async function generateSummaries(docId: string, pages: number[], sentences: number, concurrency: number, style: DataStyle, system: string): Promise<string | null> {
+  const st = useStudio.getState();
+  st.setSummaryProgress({ state: "running", done: 0, total: pages.length, summaries: 0, failed: 0, message: "" });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("summarize:generate", { llm: st.llm, id: docId, pages, sentences, style, system, concurrency });
+    if (!res.ok) {
+      st.setSummaryProgress(null);
+      return res.error ?? "Could not start generation.";
+    }
+    return null;
+  } catch (e) {
+    st.setSummaryProgress(null);
+    return (e as Error).message;
+  }
+}
+
+export const stopSummarize = () => call("summarize:stop").catch(() => {});
+export const removeSummaries = (ids: number[]) => call("summarize:remove", { ids }).catch(() => {});
+export const clearSummaries = () => call("summarize:remove", { ids: [] }).catch(() => {});
+
+// ---- Tokenizer: built-in BPE or an imported tokenizer.json ----------------------
+
+/** Uploads a Hugging Face tokenizer.json; the backend rebuilds the dataset with it. Returns an error message, or null. */
+export async function importTokenizer(file: File): Promise<string | null> {
+  const sid = getSocket().id;
+  if (!sid) return "Not connected to the backend.";
+  try {
+    const res = await fetch(`${backendUrl()}/api/tokenizer?sid=${encodeURIComponent(sid)}&name=${encodeURIComponent(file.name)}`, { method: "PUT", body: file });
+    const j = await res.json().catch(() => ({}));
+    return res.ok && j.ok ? null : j.error || `Import failed (HTTP ${res.status}).`;
+  } catch {
+    return "Could not reach the backend.";
+  }
+}
+
+/** Goes back to the built-in BPE (learned from the data). */
+export const resetTokenizer = () => call("tokenizer:default").catch(() => {});
+
+// ---- Hugging Face-style dataset export / import ------------------------------
+export type DatasetKind = "qa" | "summary";
+export type ExportStyle = "hf" | "simple" | "instruction" | "chat";
+export type ExportFormat = "jsonl" | "parquet";
+export type ImportStyle = ExportStyle | "auto";
+
+/** Downloads the dataset as JSONL or Parquet in the chosen style (built by the backend). */
+export async function exportDataset(kind: DatasetKind, style: ExportStyle, format: ExportFormat, system: string): Promise<string | null> {
+  const sid = getSocket().id;
+  if (!sid) return "Not connected to the backend.";
+  try {
+    const q = new URLSearchParams({ sid, kind, style, format, system });
+    const res = await fetch(`${backendUrl()}/api/export?${q}`);
+    if (!res.ok) return (await res.json().catch(() => ({}))).error || `Export failed (HTTP ${res.status}).`;
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${kind}-${style}.${format}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    return null;
+  } catch {
+    return "Could not reach the backend.";
+  }
+}
+
+/** Uploads a JSON / JSONL / Parquet file; the backend adds its records and pushes the refreshed list. */
+export async function importDataset(kind: DatasetKind, style: ImportStyle, file: File): Promise<{ error: string } | { added: number; skipped: number; capped: boolean }> {
+  const sid = getSocket().id;
+  if (!sid) return { error: "Not connected to the backend." };
+  try {
+    const res = await fetch(`${backendUrl()}/api/import?sid=${encodeURIComponent(sid)}&kind=${kind}&style=${style}&name=${encodeURIComponent(file.name)}`, { method: "PUT", body: file });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) return { error: j.error || `Import failed (HTTP ${res.status}).` };
+    return { added: j.added, skipped: j.skipped, capped: !!j.capped };
+  } catch {
+    return { error: "Could not reach the backend." };
+  }
+}
+
+/** Downloads the trained model as a Hugging Face-style folder (zip): config, safetensors weights, tokenizer, README. */
+export async function downloadModel(): Promise<string | null> {
+  const sid = getSocket().id;
+  if (!sid) return "Not connected to the backend.";
+  try {
+    const res = await fetch(`${backendUrl()}/api/model/export?sid=${encodeURIComponent(sid)}`);
+    if (!res.ok) return (await res.json().catch(() => ({}))).error || `Download failed (HTTP ${res.status}).`;
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "modelbuilder-model.zip";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    return null;
+  } catch {
+    return "Could not reach the backend.";
+  }
+}
 
 export const stopTraining = () => call("train:stop").catch(() => {});
 

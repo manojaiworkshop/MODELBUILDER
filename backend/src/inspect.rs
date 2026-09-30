@@ -5,7 +5,7 @@
 use crate::events::{InspectPayload, MapPoint, NextToken, TokenInfo};
 use crate::model::Model;
 use crate::spec::Analysis;
-use crate::tokenizer::{Bpe, Tokenized, EOS_ID, PAD_ID, UNK_ID, BOS_ID};
+use crate::tokenizer::{Bpe, Tokenized};
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::NdArray;
 use burn::prelude::*;
@@ -27,6 +27,9 @@ pub fn probe_ids(bpe: &Bpe, probe: &str, max_len: usize) -> Vec<u32> {
     if ids.is_empty() {
         ids = bpe.encode(" ");
     }
+    if ids.is_empty() {
+        ids = vec![0]; // an imported tokenizer may have nothing for a blank probe
+    }
     ids
 }
 
@@ -35,10 +38,6 @@ fn softmax_vec(logits: &[f32]) -> Vec<f32> {
     let e: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
     let s: f32 = e.iter().sum();
     e.into_iter().map(|x| x / s).collect()
-}
-
-fn is_special(id: usize) -> bool {
-    matches!(id as u32, PAD_ID | UNK_ID | BOS_ID | EOS_ID)
 }
 
 /// Top two principal components (power iteration) of the rows of `x` (n x d), scaled into [-1, 1].
@@ -94,7 +93,7 @@ fn pca2(x: &[f32], n: usize, d: usize) -> Vec<(f32, f32)> {
 
 pub fn embedding_map(model: &Model<IB>, tok: &Tokenized) -> Vec<MapPoint> {
     let (w, vocab, d) = model.embedding_matrix();
-    let chosen: Vec<u32> = tok.frequent.iter().cloned().filter(|&i| (i as usize) < vocab && !is_special(i as usize)).take(MAP_POINTS).collect();
+    let chosen: Vec<u32> = tok.frequent.iter().cloned().filter(|&i| (i as usize) < vocab && !tok.bpe.is_special(i)).take(MAP_POINTS).collect();
     let mut rows = Vec::with_capacity(chosen.len() * d);
     for &id in &chosen {
         rows.extend_from_slice(&w[id as usize * d..(id as usize + 1) * d]);
@@ -136,7 +135,7 @@ pub fn inspect_model(
     // Only tokens that occur in the training data are candidates: the others were never trained,
     // so listing them would just show noise.
     let seen: std::collections::HashSet<u32> = tok.frequent.iter().copied().collect();
-    let mut order: Vec<usize> = (0..probs.len()).filter(|&i| !is_special(i) && seen.contains(&(i as u32))).collect();
+    let mut order: Vec<usize> = (0..probs.len()).filter(|&i| !tok.bpe.is_special(i as u32) && seen.contains(&(i as u32))).collect();
     order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
     let next_tokens = order
         .into_iter()
@@ -182,6 +181,11 @@ pub fn generate(
     if ids.is_empty() {
         ids = bpe.encode("\n");
     }
+    if ids.is_empty() {
+        ids = vec![0];
+    }
+    let imported = bpe.imported().is_some();
+    let mut generated: Vec<u32> = Vec::new();
     let (mut out, mut pending) = (String::new(), Vec::<u8>::new());
     for i in 0..max_new {
         let start = ids.len().saturating_sub(model.max_seq_len);
@@ -190,7 +194,7 @@ pub fn generate(
         let [_, s, v] = logits.dims();
         let mut last: Vec<f32> = logits.slice([0..1, s - 1..s, 0..v]).into_data().convert::<f32>().to_vec::<f32>().unwrap_or_default();
         for (j, l) in last.iter_mut().enumerate() {
-            if is_special(j) || !ok[j] {
+            if bpe.is_special(j as u32) || !ok[j] {
                 *l = f32::NEG_INFINITY;
             }
         }
@@ -216,6 +220,21 @@ pub fn generate(
             pick
         };
         ids.push(next as u32);
+        generated.push(next as u32);
+        if imported {
+            // an imported tokenizer decodes whole sequences (spacing markers, byte fallback), so the
+            // new text is what the decoded sequence gained; an unfinished character waits
+            let full = bpe.decode_ids(&generated);
+            let stable = full.trim_end_matches('\u{FFFD}');
+            let delta = stable.get(out.len()..).unwrap_or("").to_string();
+            if stable.len() >= out.len() {
+                out = stable.to_string();
+            }
+            if !on_token(i, next as u32, &delta) {
+                break;
+            }
+            continue;
+        }
         pending.extend(bpe.token_bytes(next as u32));
         // Emit everything that is complete UTF-8. An incomplete tail (a multi-byte char split across
         // tokens) is held back; bytes that can never be valid are flushed as U+FFFD immediately.
@@ -229,6 +248,9 @@ pub fn generate(
         if !on_token(i, next as u32, &delta) {
             break;
         }
+    }
+    if imported {
+        return bpe.decode_ids(&generated);
     }
     out
 }

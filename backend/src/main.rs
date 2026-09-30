@@ -3,7 +3,9 @@
 
 mod corpus;
 mod events;
+mod export;
 mod extract;
+mod hfdata;
 mod inspect;
 mod learn;
 mod model;
@@ -11,6 +13,7 @@ mod qa;
 mod server;
 mod session;
 mod spec;
+mod summarize;
 mod tokenizer;
 mod trace;
 mod train;
@@ -56,6 +59,10 @@ async fn main() {
         .route("/health", get(move || async move { Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION"), "maxTrainings": max_trainings })) }))
         // large bodies are streamed to disk by the handler, which enforces its own limits
         .route("/api/upload", put(upload::upload).layer(DefaultBodyLimit::disable()).with_state(shared.clone()))
+        .route("/api/import", put(upload::import_dataset).layer(DefaultBodyLimit::disable()).with_state(shared.clone()))
+        .route("/api/export", get(upload::export_dataset).with_state(shared.clone()))
+        .route("/api/model/export", get(upload::export_model).with_state(shared.clone()))
+        .route("/api/tokenizer", put(upload::upload_tokenizer).layer(DefaultBodyLimit::disable()).with_state(shared.clone()))
         .route("/api/limits", get({
             let sh = shared.clone();
             move || async move { Json(json!({ "maxFileBytes": sh.max_file_bytes, "maxSessionBytes": sh.max_session_bytes, "maxTokens": sh.max_tokens })) }

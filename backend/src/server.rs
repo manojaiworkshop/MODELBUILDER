@@ -2,22 +2,30 @@
 //!
 //! client -> server (all use acks so the UI always gets a reply):
 //!   data:set        {text?, merges, usePasted}  -> {ok}      (dataset is rebuilt in the background)
+//!   tokenizer:default -                         -> {ok}      (drop an imported tokenizer; dataset is rebuilt)
+//!   PUT  /api/tokenizer?sid=&name=  raw tokenizer.json body -> {ok, name, model, fullVocab}  (dataset is rebuilt with it)
 //!   data:remove     {id}                        -> {ok}
 //!   data:toggle     {id, enabled}               -> {ok}
 //!   model:inspect   {spec, probe, seqLen}       -> InspectPayload
-//!   train:start     {spec, hyper, probe, source?: text|qa, mode?: new|continue} -> {ok, error?}
+//!   train:start     {spec, hyper, probe, source?: text|qa|summary, mode?: new|continue} -> {ok, error?}
 //!   train:stop      -                           -> {ok}
 //!   probe:set       {text}                      -> {ok}
 //!   generate        {prompt, maxNew, ...}       -> {ok, text?, error?}   (+ streams `generate:token`)
 //!   generate:stop   -                           -> {ok}
-//!   qa:pages        {id}                        -> {ok, pages, synthetic, truncated}
+//!   qa:pages        {id}                        -> {ok, pages, synthetic, truncated}   (also used to list pages for summarize)
 //!   qa:generate     {llm, id, pages, perPage, concurrency} -> {ok}   (progress: qa:progress, qa:added)
 //!   qa:stop         -                           -> {ok}
 //!   qa:remove       {ids?}                      -> {ok}   (no ids = all; then qa:list)
+//!   summarize:generate {llm, id, pages, sentences, concurrency} -> {ok}   (progress: summarize:progress, summarize:added)
+//!   summarize:stop     -                        -> {ok}
+//!   summarize:remove   {ids?}                   -> {ok}   (no ids = all; then summarize:list)
+//!   GET  /api/export?sid=&kind=&style=&format=jsonl|parquet[&system=] -> file download (see hfdata.rs)
+//!   PUT  /api/import?sid=&kind=&style=&name=  raw JSON / JSONL / Parquet body -> {ok, added, skipped}  (style may be auto; then qa:list / summarize:list)
 //!   learn:ask       {llm, block?, history, question} -> {ok, answer?: LearnAnswer, error?}
 //!   learn:test      {llm}                       -> {ok, models?: [string], error?}
 //! server -> client (pushed):
-//!   data:docs, data:progress, data:info, qa:list, qa:added, qa:progress,
+//!   data:docs, data:progress, data:info, data:tokenizer, qa:list, qa:added, qa:progress,
+//!   summarize:list, summarize:added, summarize:progress,
 //!   train:status, train:steps, train:eval, train:inspect, train:sample, generate:token
 //! Files themselves are uploaded over HTTP (see upload.rs), not through the socket.
 
@@ -25,8 +33,9 @@ use crate::events::*;
 use crate::inspect::{generate, inspect_model, IB};
 use crate::learn;
 use crate::qa;
+use crate::summarize;
 use crate::model::build;
-use crate::session::{DocState, QaJob, Session, Shared};
+use crate::session::{DocState, QaJob, Session, Shared, SummarizeJob};
 use crate::spec::analyze;
 use crate::train::{self, Event, Job};
 use burn::backend::ndarray::NdArrayDevice;
@@ -55,6 +64,19 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
     {
         let s = s.clone();
         tokio::spawn(async move { s.emit_docs().await });
+    }
+
+    // ------------------------------------------------------------ tokenizer:default
+    {
+        let s = s.clone();
+        socket.on("tokenizer:default", async move |ack: AckSender| {
+            let changed = s.data.lock().await.custom_tok.take().is_some();
+            s.emit_tokenizer().await;
+            if changed {
+                s.schedule_rebuild();
+            }
+            ack.send(&json!({ "ok": true })).ok();
+        });
     }
 
     // ------------------------------------------------------------ data:set
@@ -148,7 +170,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                     return InspectPayload::failed(msg, a.issues, a.shapes, a.total_params, cur.bpe.vocab_size(), seq_len);
                 }
                 let fp = req.spec.fingerprint();
-                if let Some(t) = trained.filter(|t| t.fingerprint == fp && t.seq_len == seq_len && (t.qa || t.tok.bpe.vocab_size() == cur.bpe.vocab_size())) {
+                if let Some(t) = trained.filter(|t| t.fingerprint == fp && t.seq_len == seq_len && (t.own_vocab || t.tok.bpe.vocab_size() == cur.bpe.vocab_size())) {
                     return inspect_model(&t.model, &t.tok, &req.probe, &a, seq_len, Some(t.step), true);
                 }
                 let dev = NdArrayDevice::default();
@@ -182,10 +204,27 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             if s.train_cancel.lock().unwrap().is_some() {
                 return ack.send(&fail("A training run is already in progress; stop it first.")).ok().unwrap_or(());
             }
-            let (tok, init, qa_run) = match req.source {
+            // Continuing needs the same architecture as the run being continued from — shared by
+            // both the Q&A and Summary sources, which each keep their own vocabulary.
+            let resolve_prior = |s: &Arc<Session>, req: &TrainStartReq| -> Result<Option<Arc<train::Trained>>, String> {
+                if req.mode != TrainMode::Continue {
+                    return Ok(None);
+                }
+                match s.trained.lock().unwrap().clone() {
+                    None => Err("There is no trained model to continue from. Train once first, or choose “New model”.".into()),
+                    Some(t) if t.fingerprint != req.spec.fingerprint() || t.seq_len != req.hyper.seq_len => {
+                        Err("The blocks or the context length changed since that model was trained. Continuing needs the same architecture — restore it, or choose “New model”.".into())
+                    }
+                    Some(t) => Ok(Some(t)),
+                }
+            };
+            let (tok, init, own_vocab) = match req.source {
                 TrainSource::Text => {
                     if req.mode == TrainMode::Continue {
-                        return ack.send(&fail("Continuing a trained model works with the Q&A dataset. Pick the Q&A dataset, or choose “New model”.")).ok().unwrap_or(());
+                        return ack
+                            .send(&fail("Continuing a trained model works with the Q&A or Summary dataset. Pick one of those, or choose “New model”."))
+                            .ok()
+                            .unwrap_or(());
                     }
                     let Some(tok) = s.data.lock().await.tok.clone() else {
                         return ack.send(&fail("No dataset loaded yet.")).ok().unwrap_or(());
@@ -200,27 +239,68 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                     if pairs.is_empty() {
                         return ack.send(&fail("There are no question-answer pairs yet. Generate some in the Data tab first.")).ok().unwrap_or(());
                     }
-                    let prior = if req.mode == TrainMode::Continue {
-                        match s.trained.lock().unwrap().clone() {
-                            None => return ack.send(&fail("There is no trained model to continue from. Train once first, or choose “New model”.")).ok().unwrap_or(()),
-                            Some(t) if t.fingerprint != req.spec.fingerprint() || t.seq_len != req.hyper.seq_len => {
-                                return ack
-                                    .send(&fail("The blocks or the context length changed since that model was trained. Continuing needs the same architecture — restore it, or choose “New model”."))
-                                    .ok()
-                                    .unwrap_or(())
-                            }
-                            Some(t) => Some(t),
-                        }
-                    } else {
-                        None
+                    let prior = match resolve_prior(&s, &req) {
+                        Ok(p) => p,
+                        Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
                     };
                     let text = qa::format_training_text(&pairs);
                     let bpe = prior.as_ref().map(|t| t.tok.bpe.clone());
-                    let tok = match tokio::task::spawn_blocking(move || qa::tokenize(&text, bpe, merges)).await {
-                        Ok(t) => Arc::new(t),
+                    let custom = s.data.lock().await.custom_tok.clone();
+                    let tok = match tokio::task::spawn_blocking(move || qa::tokenize(&text, bpe, custom, merges)).await {
+                        Ok(Ok(t)) => Arc::new(t),
+                        Ok(Err(e)) => return ack.send(&fail(e)).ok().unwrap_or(()),
                         Err(e) => return ack.send(&fail(format!("tokenizing the Q&A pairs failed: {e}"))).ok().unwrap_or(()),
                     };
                     (tok, prior.map(|t| t.model.clone()), true)
+                }
+                TrainSource::Summary => {
+                    let (pairs, merges) = {
+                        let d = s.data.lock().await;
+                        (d.summaries.clone(), d.merges)
+                    };
+                    if pairs.is_empty() {
+                        return ack.send(&fail("There are no summaries yet. Generate some in the Data tab first.")).ok().unwrap_or(());
+                    }
+                    let prior = match resolve_prior(&s, &req) {
+                        Ok(p) => p,
+                        Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+                    };
+                    let text = summarize::format_training_text(&pairs);
+                    let bpe = prior.as_ref().map(|t| t.tok.bpe.clone());
+                    let custom = s.data.lock().await.custom_tok.clone();
+                    let tok = match tokio::task::spawn_blocking(move || qa::tokenize(&text, bpe, custom, merges)).await {
+                        Ok(Ok(t)) => Arc::new(t),
+                        Ok(Err(e)) => return ack.send(&fail(e)).ok().unwrap_or(()),
+                        Err(e) => return ack.send(&fail(format!("tokenizing the summaries failed: {e}"))).ok().unwrap_or(()),
+                    };
+                    (tok, prior.map(|t| t.model.clone()), true)
+                }
+            };
+            let provenance = {
+                let d = s.data.lock().await;
+                let uniq = |styles: Vec<crate::hfdata::Style>| {
+                    let mut out: Vec<crate::hfdata::Style> = Vec::new();
+                    for st in styles {
+                        if !out.contains(&st) {
+                            out.push(st);
+                        }
+                    }
+                    out
+                };
+                match req.source {
+                    TrainSource::Text => train::Provenance { source: "text".into(), examples: tok.chars, ..Default::default() },
+                    TrainSource::Qa => train::Provenance {
+                        source: "qa".into(),
+                        styles: uniq(d.qa.iter().map(|p| p.style).collect()),
+                        system: d.qa.iter().find(|p| !p.system.is_empty()).map(|p| p.system.clone()).unwrap_or_default(),
+                        examples: d.qa.len(),
+                    },
+                    TrainSource::Summary => train::Provenance {
+                        source: "summary".into(),
+                        styles: uniq(d.summaries.iter().map(|p| p.style).collect()),
+                        system: d.summaries.iter().find(|p| !p.system.is_empty()).map(|p| p.system.clone()).unwrap_or_default(),
+                        examples: d.summaries.len(),
+                    },
                 }
             };
             let Ok(permit) = shared.trainings.clone().try_acquire_owned() else {
@@ -231,7 +311,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             *s.train_cancel.lock().unwrap() = Some(cancel.clone());
             *s.probe.lock().unwrap() = req.probe.chars().take(500).collect();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-            let job = Job { spec: req.spec, tok, hyper: req.hyper, probe: s.probe.clone(), cancel, tx, trained: s.trained.clone(), init, qa: qa_run };
+            let job = Job { spec: req.spec, tok, hyper: req.hyper, probe: s.probe.clone(), cancel, tx, trained: s.trained.clone(), init, own_vocab, provenance };
 
             // forwarder: channel -> socket
             let (fs, fsock) = (s.clone(), sock.clone());
@@ -377,7 +457,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             let mut pages = req.pages;
             pages.sort_unstable();
             pages.dedup();
-            s.spawn_qa(QaJob { llm: req.llm, pages, per_page: req.per_page, concurrency: req.concurrency }, cancel, doc);
+            s.spawn_qa(QaJob { llm: req.llm, pages, per_page: req.per_page, style: req.style.concrete(), system: req.system.trim().chars().take(2000).collect(), concurrency: req.concurrency }, cancel, doc);
             ack.send(&json!({ "ok": true })).ok();
         });
     }
@@ -406,6 +486,77 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 }
             }
             s.emit_qa_list().await;
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+
+    // -------------------------------------------------------------- summarize
+    // Page listing is shared with Q&A (`qa:pages`) — it's just the document's page boundaries,
+    // nothing specific to either dataset type.
+    {
+        let s = s.clone();
+        socket.on("summarize:generate", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SummarizeGenerateReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.pages.is_empty() || req.pages.len() > 5000 {
+                return ack.send(&fail("Select between 1 and 5000 pages.")).ok().unwrap_or(());
+            }
+            if !(1..=10).contains(&req.sentences) {
+                return ack.send(&fail("Sentences per summary must be 1..10.")).ok().unwrap_or(());
+            }
+            if !(1..=16).contains(&req.concurrency) {
+                return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
+            }
+            let l = &req.llm;
+            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            }
+            let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
+            let Some(doc) = doc else {
+                return ack.send(&fail("That document isn't ready (or was removed).")).ok().unwrap_or(());
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.summarize_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A summary generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            let mut pages = req.pages;
+            pages.sort_unstable();
+            pages.dedup();
+            s.spawn_summarize(SummarizeJob { llm: req.llm, pages, sentences: req.sentences, style: req.style.concrete(), system: req.system.trim().chars().take(2000).collect(), concurrency: req.concurrency }, cancel, doc);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("summarize:stop", async move |ack: AckSender| {
+            if let Some(c) = s.summarize_cancel.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("summarize:remove", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SummarizeRemoveReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            {
+                let mut d = s.data.lock().await;
+                if req.ids.is_empty() {
+                    d.summaries.clear();
+                } else {
+                    d.summaries.retain(|p| !req.ids.contains(&p.id));
+                }
+            }
+            s.emit_summary_list().await;
             ack.send(&json!({ "ok": true })).ok();
         });
     }

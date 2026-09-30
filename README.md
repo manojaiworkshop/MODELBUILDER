@@ -101,20 +101,73 @@ All client→server events use acks. Payloads are camelCase JSON.
 | Event | Payload → reply |
 |---|---|
 | `data:set` | `{text?, merges, usePasted}` → `{ok}`; the dataset is rebuilt in the background |
+| `tokenizer:default` | → `{ok}` — drop an imported tokenizer; the dataset is rebuilt with the built-in BPE |
+| `PUT /api/tokenizer?sid=&name=` | HTTP, raw `tokenizer.json` body → `{ok, name, model, fullVocab}`; the dataset is rebuilt with it |
 | `data:remove` / `data:toggle` | `{id}` / `{id, enabled}` |
 | `PUT /api/upload?sid=<socket id>&name=<file>` | HTTP, raw body, streamed to disk → `{ok, id}` |
 | `model:inspect` | `{spec:{blocks}, probe, seqLen}` → validation issues, shapes, param counts, and (if valid) per-block traces for the probe sentence |
 | `train:start` / `train:stop` | `{spec, hyper, probe}` → `{ok, error?}` |
 | `probe:set` | `{text}` – change the traced sentence mid-run |
 | `generate` / `generate:stop` | `{prompt, maxNew, temperature, topK}` → `{ok, text}` (tokens stream as `generate:token`) |
+| `GET /api/export?sid=&kind=&style=&format=&system=` | HTTP download: `kind` qa\|summary, `style` hf\|simple\|instruction\|chat, `format` jsonl\|parquet |
+| `PUT /api/import?sid=&kind=&style=&name=` | HTTP, JSON / JSONL / Parquet body (`style` may be `auto`) → `{ok, added, skipped}` |
+| `GET /api/model/export?sid=` | HTTP download of the last trained model as a Hugging Face-style zip (see below) |
 | `learn:ask` | `{llm:{baseUrl,apiKey,model}, block?, history, question}` → `{ok, answer?, error?}` |
 | `learn:test` | `{baseUrl, apiKey, model}` → `{ok, models?, error?}` — cheap reachability check |
 
-Server pushes while preparing data: `data:docs` (document list + extraction status), `data:progress`, `data:info` (tokens, vocabulary, source size).
+Server pushes while preparing data: `data:docs` (document list + extraction status), `data:tokenizer` (which tokenizer is in use), `data:progress`, `data:info` (tokens, vocabulary, source size).
 
 Server pushes during a run: `train:status`, `train:steps` (batched loss/lr/speed), `train:eval` (validation loss), `train:inspect` (full network snapshot with gradient norms), `train:sample`.
 
 The spec is exactly what the **Spec** tab of the live code panel shows.
+
+## Tokenizer: default or your own `tokenizer.json`
+
+The **Tokenizer** card in the Data tab has two modes:
+
+- **Default tokenizer** — the byte-level BPE described below, learned from your data (merges slider).
+- **Import tokenizer.json** — any Hugging Face `tokenizer.json` (BPE, Unigram, WordPiece or WordLevel: the one in a Gemma, Llama, Qwen or GPT-2 folder, or one you trained with `tokenizers`). It applies to everything you train on: text and files, Q&A pairs, and summaries. **Replace** swaps the file, **Default tokenizer** switches back; the dataset rebuilds either way.
+
+Real tokenizers have 30k–260k ids, far more than a small model trained from scratch can use, so the model's vocabulary is **only the ids your data actually uses** (the card shows e.g. "uses 4,310 of 262,144"). Ids are assigned in ascending original order; text you type later (prompts, sampling) that contains a never-seen id simply drops it. No BOS/EOS tokens are added. At most 65,535 distinct ids may occur in the data, and an imported tokenizer keeps at most 100 M tokens of it (`MAX_TOKENIZER_BYTES`, default 128 MiB, caps the file).
+
+Downloading the model then ships your `tokenizer.json` unchanged, plus `token_map.json` (embedding row → tokenizer id) and `original_vocab_size` in `config.json`.
+
+## Hugging Face-style Q&A and summary datasets
+
+The Q&A and Summary cards can **export** their pairs as **JSONL** (one object per line, `load_dataset("json", data_files=...)`) or **Parquet** (`load_dataset("parquet", data_files=...)`, pandas, Spark), and **import** either, in four styles:
+
+| Style | Q&A | Summary |
+|---|---|---|
+| Hugging Face | SQuAD: `id, title, context, question, answers{text[], answer_start[]}` (`answer_start` is -1 when the answer isn't a verbatim span) | CNN/DailyMail: `id, article, highlights` |
+| Simple | `context, question, answer` | `document, summary` |
+| Instruction (Alpaca) | `instruction` (question), `input` (context), `output` (answer) | `instruction` ("Summarize the following text."), `input` (text), `output` |
+| Chat | `messages: [{role: system?, …}, {role: user, …}, {role: assistant, …}]` | same |
+
+**Generation style.** The same styles are chosen when *generating* (the **Style** field on each card): the prompt changes what the LLM writes (SQuAD → answers copied verbatim from the page; CNN/DailyMail → one-line highlights; Chat → assistant-voice replies), and each pair remembers its style, which sets how it is laid out as training text:
+
+| Style | Q&A training text | Summary training text |
+|---|---|---|
+| Simple | `Question: … / Answer: …` | `Text: … / Summary: …` |
+| Hugging Face | `Context: … / Question: … / Answer: …` | `Article: … / Highlights: …` |
+| Instruction | `### Instruction: … ### Input: … ### Response: …` | `### Instruction: Summarize… ### Input: … ### Response: …` |
+| Chat | optional `<\|system\|>`, then `<\|user\|> … <\|assistant\|> …` | `<\|user\|> Summarize the following text: … <\|assistant\|> …` |
+
+Import can also auto-detect the style per record, and accepts JSON arrays, `{"data": [...]}` wrappers and the official nested SQuAD file. Imported pairs join the ones you generated and can be trained on the same way (training uses question/answer, or text/summary). Files up to `MAX_IMPORT_BYTES` (64 MiB).
+
+## Download the trained model (Hugging Face format)
+
+When a run finishes, the **Next run** card offers **Download model**: a zip with a `modelbuilder-model/` folder laid out like a Hugging Face model repository:
+
+| File | Contents |
+|---|---|
+| `config.json` | `model_type: "modelbuilder"`, sizes (`hidden_size`, `num_attention_heads`, `intermediate_size`, experts, …) and the full `blocks` list |
+| `model.safetensors` | all weights, float32, named like a Llama/Gemma checkpoint (`model.embed_tokens.weight`, `model.blocks.<n>.self_attn.q_proj.weight`, `…mlp.experts.<e>.down_proj.weight`, `lm_head.weight` if untied); linear weights are `[out, in]` |
+| `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json` | the byte-level BPE, in the standard `tokenizers` format |
+| `generation_config.json` | default sampling settings |
+| `chat_template.jinja` | only for models trained on chat-style pairs; renders `messages` in the layout it learned |
+| `README.md` | model card: architecture, training settings, final loss, prompt format |
+
+`AutoTokenizer.from_pretrained("modelbuilder-model")` works and encodes exactly like the app (the app's pre-tokenizer is the GPT-2 regex, checked against the `tokenizers` library), and the weights load with `safetensors`. The network is a custom block stack, so `AutoModel` cannot build it by itself: `config.json` and the tensor names carry everything needed to re-implement it. A stopped run can be downloaded too (the card says at which step).
 
 ## Limits (enforced by the backend)
 

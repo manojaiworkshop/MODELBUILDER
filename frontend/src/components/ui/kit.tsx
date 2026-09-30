@@ -1,4 +1,5 @@
 "use client";
+import { ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 export const cn = (...c: (string | false | null | undefined)[]) => c.filter(Boolean).join(" ");
@@ -159,13 +160,23 @@ export function Card({ children, className }: { children: ReactNode; className?:
   return <section className={cn("rounded-xl border border-border bg-surface shadow-card", className)}>{children}</section>;
 }
 
-export function SectionHeader({ title, sub, right, icon }: { title: string; sub?: string; right?: ReactNode; icon?: ReactNode }) {
+export function SectionHeader({ title, sub, right, icon, collapsed, onToggle }: { title: string; sub?: string; right?: ReactNode; icon?: ReactNode; collapsed?: boolean; onToggle?: () => void }) {
+  const text = (
+    <>
+      <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">{icon}{title}</h3>
+      {sub && !collapsed && <p className="mt-0.5 text-xs text-muted">{sub}</p>}
+    </>
+  );
   return (
-    <div className="flex items-start justify-between gap-3 px-4 pt-3.5 pb-2">
-      <div className="min-w-0">
-        <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">{icon}{title}</h3>
-        {sub && <p className="mt-0.5 text-xs text-muted">{sub}</p>}
-      </div>
+    <div className={cn("flex items-start justify-between gap-3 px-4 pt-3.5", collapsed ? "pb-3.5" : "pb-2")}>
+      {onToggle ? (
+        <button type="button" onClick={onToggle} aria-expanded={!collapsed} className="flex min-w-0 flex-1 items-start gap-2 text-left">
+          <ChevronDown size={16} className={cn("mt-0.5 shrink-0 text-muted transition-transform", collapsed && "-rotate-90")} />
+          <div className="min-w-0">{text}</div>
+        </button>
+      ) : (
+        <div className="min-w-0">{text}</div>
+      )}
       {right}
     </div>
   );
