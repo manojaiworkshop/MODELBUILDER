@@ -64,6 +64,18 @@ How it scales: text is extracted to disk; the BPE vocabulary is learned from a ~
 
 Formats that must be loaded whole (PDF, Excel, HTML, RTF) are limited to 512 MB per file. Files are only kept while the tab is open.
 
+## Learn tab: an AI tutor grounded in your model
+
+Every block has an **i** button; click it to open the **Learn** tab, showing that block's concept, formula and a worked example computed from its actual live settings (not generic docs). Below that is a chat: ask anything, and an LLM answers — grounded in whichever block you have open (its type and full JSON config are sent as context) — with prose, 0-4 formulas, an optional node/edge diagram (drawn on canvas, auto-laid-out left-to-right), and follow-up question chips.
+
+This needs an **OpenAI-compatible `/v1/chat/completions` server** you point at yourself — e.g. a self-hosted proxy in front of Claude, not a public cloud endpoint. Configure it from the gear icon next to the chat input: base URL, API key, model name. All three are stored only in the browser (localStorage); "Test connection" hits `GET {base}/models` to check reachability before you spend a real request. Change the IP or model name any time — nothing is baked into the app.
+
+The model is asked to reply as one JSON object (`text`, `formulas[]`, `diagram | null`, `followUps[]`); the backend parses this defensively field-by-field, so a model that gets one field's shape slightly wrong (e.g. returns `formulas` as bare strings instead of `{label, expr}` objects — observed in practice) still renders correctly instead of dumping raw JSON. Diagram edges pointing at a nonexistent node id are dropped rather than crashing the canvas.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_LEARN_ASKS` | 4 | concurrent chat questions across all sessions |
+
 ## What the blocks are
 
 The backend's block library is taken from the `transformer_rs` project (`~/Documents/NLPWORLD/RUST_TRANFORMER/transformer_rs`):
@@ -95,6 +107,8 @@ All client→server events use acks. Payloads are camelCase JSON.
 | `train:start` / `train:stop` | `{spec, hyper, probe}` → `{ok, error?}` |
 | `probe:set` | `{text}` – change the traced sentence mid-run |
 | `generate` / `generate:stop` | `{prompt, maxNew, temperature, topK}` → `{ok, text}` (tokens stream as `generate:token`) |
+| `learn:ask` | `{llm:{baseUrl,apiKey,model}, block?, history, question}` → `{ok, answer?, error?}` |
+| `learn:test` | `{baseUrl, apiKey, model}` → `{ok, models?, error?}` — cheap reachability check |
 
 Server pushes while preparing data: `data:docs` (document list + extraction status), `data:progress`, `data:info` (tokens, vocabulary, source size).
 
@@ -109,11 +123,11 @@ Pasted text ≤ 2 MB (files: see above) · ≤ 40 blocks · `d_model` ≤ 512 ·
 ## Tests
 
 ```bash
-cd backend  && cargo test --release     # 31 tests, incl. real Word/PDF/Excel/PowerPoint fixtures
+cd backend  && cargo test --release     # 43 tests, incl. real Word/PDF/Excel/PowerPoint fixtures and a mock chat-completions server
 cd frontend && npx tsc --noEmit && npm run lint && npm run build
 ```
 
-Backend tests check, among other things, that the analytic parameter count equals burn's exact count for every block type, that changing a later token never changes earlier logits (causality), that sliding-window/sink masks and top-k routing behave as specified, and that a small Gemma+MoE+sink model's loss actually falls.
+Backend tests check, among other things, that the analytic parameter count equals burn's exact count for every block type, that changing a later token never changes earlier logits (causality), that sliding-window/sink masks and top-k routing behave as specified, that a small Gemma+MoE+sink model's loss actually falls, and that the Learn chat's JSON-schema parsing degrades gracefully (formulas as bare strings, JSON wrapped in prose/fences, a malformed diagram, connection/auth errors) against a real mock HTTP server spun up per test.
 
 ## Notes
 

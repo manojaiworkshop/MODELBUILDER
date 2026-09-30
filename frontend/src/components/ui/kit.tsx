@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 export const cn = (...c: (string | false | null | undefined)[]) => c.filter(Boolean).join(" ");
 
@@ -168,5 +168,50 @@ export function SectionHeader({ title, sub, right, icon }: { title: string; sub?
       </div>
       {right}
     </div>
+  );
+}
+
+// ------------------------------------------------------------------- modal
+export function Modal({ open, onClose, title, sub, icon, children, width = "max-w-lg" }: { open: boolean; onClose: () => void; title: string; sub?: string; icon?: ReactNode; children: ReactNode; width?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    ref.current?.focus();
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="presentation">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px]" onClick={onClose} aria-hidden />
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+        className={cn("fade-in relative z-10 max-h-[85vh] w-full overflow-y-auto rounded-xl border border-border bg-surface shadow-card outline-none", width)}
+      >
+        <div className="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-border bg-surface px-4 py-3.5">
+          <div className="min-w-0">
+            <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">{icon}{title}</h3>
+            {sub && <p className="mt-0.5 text-xs text-muted">{sub}</p>}
+          </div>
+          <button onClick={onClose} aria-label="Close" className="shrink-0 rounded-md p-1.5 text-muted hover:bg-surface-2 hover:text-fg">
+            <XIcon />
+          </button>
+        </div>
+        <div className="p-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function XIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
   );
 }

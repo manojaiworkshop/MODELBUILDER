@@ -24,6 +24,10 @@ pub struct Shared {
     pub trainings: Arc<Semaphore>,
     pub extractions: Arc<Semaphore>,
     pub builds: Arc<Semaphore>,
+    /// Concurrent Learn-tab chat requests (each is an outbound HTTP call to a user-configured server).
+    pub learns: Arc<Semaphore>,
+    /// Shared, connection-pooling client for talking to that server.
+    pub http: reqwest::Client,
     pub sessions: Mutex<HashMap<String, Arc<Session>>>,
     pub data_dir: PathBuf,
     /// Largest single upload.
@@ -50,6 +54,8 @@ impl Shared {
             trainings: Arc::new(Semaphore::new(env_u64("MAX_TRAININGS", 2) as usize)),
             extractions: Arc::new(Semaphore::new(env_u64("MAX_EXTRACTIONS", 2) as usize)),
             builds: Arc::new(Semaphore::new(env_u64("MAX_BUILDS", 2) as usize)),
+            learns: Arc::new(Semaphore::new(env_u64("MAX_LEARN_ASKS", 4) as usize)),
+            http: reqwest::Client::builder().build().expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
             max_file_bytes: env_u64("MAX_UPLOAD_BYTES", 1 << 30),

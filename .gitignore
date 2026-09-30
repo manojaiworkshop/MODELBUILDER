@@ -7,7 +7,6 @@ target/
 node_modules/
 .next/
 out/
-build/
 dist/
 .turbo/
 .vercel/

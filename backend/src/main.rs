@@ -5,6 +5,7 @@ mod corpus;
 mod events;
 mod extract;
 mod inspect;
+mod learn;
 mod model;
 mod server;
 mod session;

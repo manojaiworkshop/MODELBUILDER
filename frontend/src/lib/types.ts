@@ -193,3 +193,47 @@ export interface SamplePayload {
   prompt: string;
   text: string;
 }
+
+// -------------------------------------------------------------- Learn chat
+
+export interface FormulaItem {
+  label: string | null;
+  expr: string;
+}
+export interface DiagramNode {
+  id: string;
+  label: string;
+  sublabel: string | null;
+  level: number | null;
+}
+export interface DiagramEdge {
+  from: string;
+  to: string;
+  label: string | null;
+}
+export interface DiagramSpec {
+  title: string | null;
+  nodes: DiagramNode[];
+  edges: DiagramEdge[];
+}
+export interface LearnAnswer {
+  text: string;
+  formulas: FormulaItem[];
+  diagram: DiagramSpec | null;
+  followUps: string[];
+}
+export interface LlmConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+export interface LearnChatMsg {
+  id: string;
+  role: "user" | "assistant";
+  /** set when role is "user" */
+  question?: string;
+  /** set when role is "assistant" and it succeeded */
+  answer?: LearnAnswer;
+  pending?: boolean;
+  error?: string;
+}

@@ -2,7 +2,8 @@
 import { useEffect, useRef } from "react";
 import { call, getSocket } from "./backend";
 import { isRunning, useStudio } from "./store";
-import type { BuildProgress, DataInfo, DocInfo, EvalPoint, InspectPayload, SamplePayload, StatusPayload, StepPoint } from "./types";
+import { blockLabel, CATALOG } from "./blocks";
+import type { BuildProgress, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, SamplePayload, StatusPayload, StepPoint } from "./types";
 
 /** Keeps the backend in step with the UI. Mount once. */
 export function useBackendSync() {
@@ -161,3 +162,72 @@ export async function generateText(prompt: string, opts: { maxNew: number; tempe
 }
 
 export const stopGenerate = () => call("generate:stop").catch(() => {});
+
+// ---- Learn chat --------------------------------------------------------------
+
+let chatIdSeq = 0;
+const chatId = () => `c${Date.now().toString(36)}${chatIdSeq++}`;
+
+export async function askLearn(question: string) {
+  const q = question.trim();
+  if (!q) return;
+  const st = useStudio.getState();
+  if (st.learnChatBusy) return;
+
+  const idx = st.blocks.findIndex((b) => b.id === st.learnBlockId);
+  const block = idx >= 0 ? { title: blockLabel(st.blocks, idx), summary: CATALOG[st.blocks[idx].type].summary(st.blocks[idx]), params: st.blocks[idx] } : undefined;
+  // last few turns only — enough continuity without an ever-growing prompt
+  const history = st.learnChat
+    .filter((m) => (m.role === "user" && m.question) || (m.role === "assistant" && m.answer))
+    .slice(-8)
+    .map((m) => (m.role === "user" ? { role: "user" as const, content: m.question! } : { role: "assistant" as const, content: m.answer!.text }));
+
+  const userMsg = { id: chatId(), role: "user" as const, question: q };
+  const pendingId = chatId();
+  st.pushLearnMsg(userMsg);
+  st.pushLearnMsg({ id: pendingId, role: "assistant", pending: true });
+  st.setLearnChatBusy(true);
+  try {
+    const res = await call<{ ok: boolean; answer?: LearnAnswer; error?: string }>("learn:ask", { llm: st.llm, block, history, question: q }, 130_000);
+    if (res.ok && res.answer) st.updateLearnMsg(pendingId, { pending: false, answer: res.answer });
+    else st.updateLearnMsg(pendingId, { pending: false, error: res.error ?? "The model didn't answer." });
+  } catch (e) {
+    st.updateLearnMsg(pendingId, { pending: false, error: (e as Error).message });
+  } finally {
+    st.setLearnChatBusy(false);
+  }
+}
+
+/** Retries the question of an errored assistant turn in place, replacing it. */
+export async function retryLearn(msgId: string) {
+  const st = useStudio.getState();
+  const i = st.learnChat.findIndex((m) => m.id === msgId);
+  const question = i > 0 ? st.learnChat[i - 1]?.question : undefined;
+  if (!question) return;
+  st.updateLearnMsg(msgId, { pending: true, error: undefined });
+  st.setLearnChatBusy(true);
+  const idx = st.blocks.findIndex((b) => b.id === st.learnBlockId);
+  const block = idx >= 0 ? { title: blockLabel(st.blocks, idx), summary: CATALOG[st.blocks[idx].type].summary(st.blocks[idx]), params: st.blocks[idx] } : undefined;
+  const history = st.learnChat
+    .slice(0, i - 1)
+    .filter((m) => (m.role === "user" && m.question) || (m.role === "assistant" && m.answer))
+    .slice(-8)
+    .map((m) => (m.role === "user" ? { role: "user" as const, content: m.question! } : { role: "assistant" as const, content: m.answer!.text }));
+  try {
+    const res = await call<{ ok: boolean; answer?: LearnAnswer; error?: string }>("learn:ask", { llm: st.llm, block, history, question }, 130_000);
+    if (res.ok && res.answer) st.updateLearnMsg(msgId, { pending: false, answer: res.answer });
+    else st.updateLearnMsg(msgId, { pending: false, error: res.error ?? "The model didn't answer." });
+  } catch (e) {
+    st.updateLearnMsg(msgId, { pending: false, error: (e as Error).message });
+  } finally {
+    st.setLearnChatBusy(false);
+  }
+}
+
+export async function testLlmConnection(cfg: LlmConfig): Promise<{ ok: boolean; error?: string; models?: string[] }> {
+  try {
+    return await call("learn:test", cfg, 20_000);
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}

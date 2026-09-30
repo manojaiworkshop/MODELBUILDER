@@ -10,6 +10,8 @@
 //!   probe:set       {text}                      -> {ok}
 //!   generate        {prompt, maxNew, ...}       -> {ok, text?, error?}   (+ streams `generate:token`)
 //!   generate:stop   -                           -> {ok}
+//!   learn:ask       {llm, block?, history, question} -> {ok, answer?: LearnAnswer, error?}
+//!   learn:test      {llm}                       -> {ok, models?: [string], error?}
 //! server -> client (pushed):
 //!   data:docs, data:progress, data:info,
 //!   train:status, train:steps, train:eval, train:inspect, train:sample, generate:token
@@ -17,6 +19,7 @@
 
 use crate::events::*;
 use crate::inspect::{generate, inspect_model, IB};
+use crate::learn;
 use crate::model::build;
 use crate::session::{DocState, Session, Shared};
 use crate::spec::analyze;
@@ -271,6 +274,43 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 c.store(true, Ordering::Relaxed);
             }
             ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+
+    // ---------------------------------------------------------------- learn
+    {
+        let shared = shared.clone();
+        socket.on("learn:ask", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: learn::AskReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.question.trim().is_empty() {
+                return ack.send(&fail("Type a question first.")).ok().unwrap_or(());
+            }
+            if req.question.len() > 4000 {
+                return ack.send(&fail("That question is a bit long — keep it under 4000 characters.")).ok().unwrap_or(());
+            }
+            let Ok(_permit) = shared.learns.clone().try_acquire_owned() else {
+                return ack.send(&fail("The model server is busy with other questions right now — try again in a moment.")).ok().unwrap_or(());
+            };
+            match learn::ask(&shared.http, &req).await {
+                Ok(answer) => ack.send(&json!({ "ok": true, "answer": answer })).ok(),
+                Err(e) => ack.send(&fail(e)).ok(),
+            };
+        });
+    }
+    {
+        let shared = shared.clone();
+        socket.on("learn:test", async move |Data(v): Data<Value>, ack: AckSender| {
+            let cfg: learn::LlmConfig = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            match learn::list_models(&shared.http, &cfg).await {
+                Ok(models) => ack.send(&json!({ "ok": true, "models": models })).ok(),
+                Err(e) => ack.send(&fail(e)).ok(),
+            };
         });
     }
 

@@ -1,10 +1,11 @@
 "use client";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { makeBlock } from "./blocks";
+import { makeBlock, newId } from "./blocks";
 import { PRESETS } from "./presets";
 import { DEFAULT_SAMPLE } from "./samples";
-import type { Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, SamplePayload, StatusPayload, StepPoint, UploadItem } from "./types";
+import { seedGroups, uniqueLabel, type BlockGroup, type GroupMembership } from "./transformerGroups";
+import type { Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, SamplePayload, StatusPayload, StepPoint, UploadItem } from "./types";
 
 /** Enough merges for frequent words to become single tokens on a small corpus. */
 export const DEFAULT_MERGES = 200;
@@ -32,14 +33,45 @@ export interface Studio {
 
   // ---- model
   blocks: Block[];
+  /** Purely a canvas-arrangement concept, kept off `Block` itself so the Spec/backend payload
+   * stays flat and untouched: which rectangular container (if any) each block currently renders
+   * inside. A group's members are always kept contiguous in `blocks` by every action below. */
+  groups: BlockGroup[];
+  groupOf: GroupMembership;
   selectedId: string | null;
   hoverId: string | null;
+  /** Replaces the whole stack (preset load, reset) and re-seeds groups from scratch by
+   * pattern-detecting adjacent [Attention, Feed-Forward] pairs — a one-time convenience so
+   * presets look organized immediately, not an ongoing source of truth. */
   setBlocks: (b: Block[]) => void;
   addBlock: (type: BlockType, index?: number) => void;
-  addLayer: (index?: number) => void;
+  /** Same as `addBlock`, but for drops resolved to a container: `targetGroupId` (null = top level)
+   * and `before` (id to land immediately before; null = append to that scope's end). */
+  addBlockTo: (type: BlockType, targetGroupId: string | null, before: string | null) => void;
+  /** Inserts one fresh Self-Attention + Feed-Forward pair, already wrapped in a new Transformer
+   * Block container — the pre-norm/residual math lives inside each block's own settings, so the
+   * container is purely visual (see Attn::forward's `x + out`, not `Norm(x) + out`). */
+  addTransformerBlock: (index?: number) => void;
   removeBlock: (id: string) => void;
+  /** Removes several blocks at once (by id) in a single update — used for whole-group removal,
+   * where removing one at a time would shift the others' indices mid-operation. */
+  removeBlocks: (ids: string[]) => void;
   duplicateBlock: (id: string) => void;
-  moveBlock: (from: number, to: number) => void;
+  /** Moves one block to a new spot: `targetGroupId` is the container it should end up inside
+   * (null = top level), `before` is the id of the block it should land immediately before (null =
+   * append to the end of that scope). The sole primitive behind all drag-and-drop reordering,
+   * regrouping, and ungrouping. */
+  moveBlockTo: (blockId: string, targetGroupId: string | null, before: string | null) => void;
+  /** Reorders a whole group (all its members, staying contiguous) among the top-level items,
+   * inserting it immediately before `beforeAnchorBlockId` (or at the end if null/not found). */
+  moveGroupTo: (groupId: string, beforeAnchorBlockId: string | null) => void;
+  /** Clones every block in a group (fresh ids) into a brand new group inserted right after it. */
+  duplicateGroup: (groupId: string) => void;
+  /** Removes a group's container AND every block inside it. */
+  removeGroup: (groupId: string) => void;
+  /** Dissolves a group's container, leaving its blocks in place at the top level. */
+  ungroup: (groupId: string) => void;
+  renameGroup: (groupId: string, label: string) => void;
   updateBlock: (id: string, patch: Record<string, unknown>) => void;
   select: (id: string | null) => void;
   hover: (id: string | null) => void;
@@ -97,10 +129,45 @@ export interface Studio {
   // ---- ui
   splitPct: number;
   setSplit: (n: number) => void;
+  /** Which top-level tab the right column shows. */
+  rightTab: "observe" | "code" | "learn";
+  setRightTab: (t: Studio["rightTab"]) => void;
+  /** Block whose concepts the Learn tab is showing. */
+  learnBlockId: string | null;
+  /** Switches the right column to the Learn tab for this block (and, on phones, brings that column into view). */
+  openLearn: (blockId: string) => void;
+  /** Whether the Live code tab shows the whole model (read-only, generated) or one block's editable Playground. */
+  codeMode: "model" | "block";
+  setCodeMode: (m: Studio["codeMode"]) => void;
+  /** Block the Playground is showing. */
+  codeBlockId: string | null;
+  /** Switches the right column to the Live code tab, in Playground mode, for this block. */
+  openBlockCode: (blockId: string) => void;
+  /** User's edits to a block's Playground snippet, keyed by block id; absent = still the starter code. */
+  playgroundCode: Record<string, string>;
+  setPlaygroundCode: (blockId: string, code: string) => void;
+  resetPlaygroundCode: (blockId: string) => void;
+  /** On phones, Build and the right column (Observe/Learn/Live code) are separate screens. */
+  mobilePane: "build" | "right";
+  setMobilePane: (p: Studio["mobilePane"]) => void;
+
+  // ---- Learn chat
+  llm: LlmConfig;
+  setLlm: (p: Partial<LlmConfig>) => void;
+  learnChat: LearnChatMsg[];
+  learnChatBusy: boolean;
+  pushLearnMsg: (m: LearnChatMsg) => void;
+  updateLearnMsg: (id: string, patch: Partial<LearnChatMsg>) => void;
+  clearLearnChat: () => void;
+  setLearnChatBusy: (b: boolean) => void;
+  settingsOpen: boolean;
+  setSettingsOpen: (b: boolean) => void;
 }
 
+export const DEFAULT_LLM: LlmConfig = { baseUrl: "", apiKey: "", model: "claude-sonnet-5" };
+
 /** The subset of state kept in localStorage. */
-type Persisted = Pick<Studio, "blocks" | "merges" | "probe" | "hyper" | "splitPct" | "usePasted"> & { text: string | undefined };
+type Persisted = Pick<Studio, "blocks" | "groups" | "groupOf" | "merges" | "probe" | "hyper" | "splitPct" | "usePasted" | "llm"> & { text: string | undefined };
 
 const initialBlocks = () => PRESETS[0].build();
 
@@ -114,16 +181,21 @@ function clampInsert(blocks: Block[], type: BlockType, index?: number): number {
   return Math.min(hi, Math.max(lo, index ?? n));
 }
 
+const seedInitial = initialBlocks();
+const { groups: initialGroups, groupOf: initialGroupOf } = seedGroups(seedInitial);
+
 export const useStudio = create<Studio>()(
   persist(
     (set) => ({
       conn: "connecting",
       setConn: (conn) => set({ conn }),
 
-      blocks: initialBlocks(),
+      blocks: seedInitial,
+      groups: initialGroups,
+      groupOf: initialGroupOf,
       selectedId: null,
       hoverId: null,
-      setBlocks: (blocks) => set({ blocks, selectedId: null }),
+      setBlocks: (blocks) => set(() => ({ blocks, ...seedGroups(blocks), selectedId: null })),
       addBlock: (type, index) =>
         set((s) => {
           const b = makeBlock(type);
@@ -132,39 +204,160 @@ export const useStudio = create<Studio>()(
           blocks.splice(at, 0, b);
           return { blocks, selectedId: b.id };
         }),
-      addLayer: (index) =>
+      addBlockTo: (type, targetGroupId, before) =>
+        set((s) => {
+          const gid = type === "embedding" || type === "head" ? null : targetGroupId;
+          const b = makeBlock(type);
+          const blocks = s.blocks.slice();
+          let at: number;
+          if (before) {
+            at = blocks.findIndex((x) => x.id === before);
+            if (at < 0) at = blocks.length;
+          } else if (gid) {
+            let last = -1;
+            for (let k = 0; k < blocks.length; k++) if (s.groupOf[blocks[k].id] === gid) last = k;
+            at = last >= 0 ? last + 1 : blocks.length;
+          } else {
+            at = blocks.length;
+          }
+          at = clampInsert(blocks, type, at);
+          blocks.splice(at, 0, b);
+          const groupOf = gid ? { ...s.groupOf, [b.id]: gid } : s.groupOf;
+          return { blocks, groupOf, selectedId: b.id };
+        }),
+      addTransformerBlock: (index) =>
         set((s) => {
           const blocks = s.blocks.slice();
           const at = clampInsert(blocks, "attention", index);
           const d = blocks.find((b) => b.type === "embedding");
           const heads = d && d.type === "embedding" && d.d_model % 4 === 0 ? 4 : 1;
+          // pre_norm+residual live inside each block, not as separate cards: a standalone Norm
+          // card in between would apply BEFORE this block sees x, so its own residual add would
+          // skip around only itself, adding back the *normalized* value instead of the true
+          // pre-norm x — wrong math (verified against Attn::forward's `x + out`, not `h + out`).
+          // The container these two land in is purely a visual grouping on top of that.
           const attn = { ...makeBlock("attention"), n_heads: heads, n_kv_heads: heads } as Block;
-          blocks.splice(at, 0, attn, makeBlock("ffn"));
-          return { blocks, selectedId: attn.id };
+          const ffn = makeBlock("ffn");
+          blocks.splice(at, 0, attn, ffn);
+          const gid = newId();
+          const groupOf = { ...s.groupOf, [attn.id]: gid, [ffn.id]: gid };
+          const groups = [...s.groups, { id: gid, label: uniqueLabel(`Transformer Block ${s.groups.length + 1}`, s.groups) }];
+          return { blocks, groupOf, groups, selectedId: attn.id };
         }),
-      removeBlock: (id) => set((s) => ({ blocks: s.blocks.filter((b) => b.id !== id), selectedId: s.selectedId === id ? null : s.selectedId })),
+      removeBlock: (id) =>
+        set((s) => {
+          const blocks = s.blocks.filter((b) => b.id !== id);
+          const groupOf = { ...s.groupOf };
+          const gid = groupOf[id];
+          delete groupOf[id];
+          const groups = gid && !blocks.some((b) => groupOf[b.id] === gid) ? s.groups.filter((g) => g.id !== gid) : s.groups;
+          return { blocks, groupOf, groups, selectedId: s.selectedId === id ? null : s.selectedId };
+        }),
+      removeBlocks: (ids) =>
+        set((s) => {
+          const gone = new Set(ids);
+          const blocks = s.blocks.filter((b) => !gone.has(b.id));
+          const groupOf = { ...s.groupOf };
+          const touched = new Set<string>();
+          for (const id of ids) {
+            const gid = groupOf[id];
+            if (gid) touched.add(gid);
+            delete groupOf[id];
+          }
+          const groups = s.groups.filter((g) => !touched.has(g.id) || blocks.some((b) => groupOf[b.id] === g.id));
+          return { blocks, groupOf, groups, selectedId: s.selectedId && gone.has(s.selectedId) ? null : s.selectedId };
+        }),
       duplicateBlock: (id) =>
         set((s) => {
           const i = s.blocks.findIndex((b) => b.id === id);
           if (i < 0 || s.blocks[i].type === "embedding" || s.blocks[i].type === "head") return s;
-          const copy = { ...s.blocks[i], id: makeBlock("dropout").id } as Block;
+          const copy = { ...s.blocks[i], id: newId() } as Block;
           const blocks = s.blocks.slice();
           blocks.splice(i + 1, 0, copy);
-          return { blocks, selectedId: copy.id };
+          const gid = s.groupOf[id];
+          const groupOf = gid ? { ...s.groupOf, [copy.id]: gid } : s.groupOf;
+          return { blocks, groupOf, selectedId: copy.id };
         }),
-      moveBlock: (from, to) =>
+      moveBlockTo: (blockId, targetGroupId, before) =>
         set((s) => {
-          const n = s.blocks.length;
-          if (from === to || from < 0 || to < 0 || from >= n || to >= n) return s;
-          const lo = s.blocks[0]?.type === "embedding" ? 1 : 0;
-          const hi = s.blocks[n - 1]?.type === "head" ? n - 2 : n - 1;
-          const dest = Math.min(hi, Math.max(lo, to));
-          if (dest === from) return s;
+          if (before === blockId) return s; // "insert before myself" is a no-op, not "move to the end"
+          const i = s.blocks.findIndex((b) => b.id === blockId);
+          if (i < 0) return s;
+          const moving = s.blocks[i];
+          // embedding/head are structural singletons (always first/last) — never groupable
+          if (targetGroupId && (moving.type === "embedding" || moving.type === "head")) return s;
           const blocks = s.blocks.slice();
-          const [b] = blocks.splice(from, 1);
-          blocks.splice(dest, 0, b);
-          return { blocks };
+          blocks.splice(i, 1);
+          let at: number;
+          if (before) {
+            at = blocks.findIndex((b) => b.id === before);
+            if (at < 0) at = blocks.length;
+          } else if (targetGroupId) {
+            let last = -1;
+            for (let k = 0; k < blocks.length; k++) if (s.groupOf[blocks[k].id] === targetGroupId) last = k;
+            at = last >= 0 ? last + 1 : blocks.length;
+          } else {
+            at = blocks.length;
+          }
+          at = clampInsert(blocks, moving.type, at);
+          blocks.splice(at, 0, moving);
+          const groupOf = { ...s.groupOf };
+          if (targetGroupId) groupOf[blockId] = targetGroupId;
+          else delete groupOf[blockId];
+          const oldGroupId = s.groupOf[blockId];
+          let groups = s.groups;
+          if (oldGroupId && oldGroupId !== targetGroupId && !blocks.some((b) => groupOf[b.id] === oldGroupId)) {
+            groups = s.groups.filter((g) => g.id !== oldGroupId);
+          }
+          return { blocks, groupOf, groups, selectedId: blockId };
         }),
+      moveGroupTo: (groupId, beforeAnchorBlockId) =>
+        set((s) => {
+          const memberIds = new Set(s.blocks.filter((b) => s.groupOf[b.id] === groupId).map((b) => b.id));
+          if (memberIds.size === 0) return s;
+          const members = s.blocks.filter((b) => memberIds.has(b.id));
+          const rest = s.blocks.filter((b) => !memberIds.has(b.id));
+          let at = beforeAnchorBlockId ? rest.findIndex((b) => b.id === beforeAnchorBlockId) : -1;
+          if (at < 0) at = rest.length;
+          const lo = rest[0]?.type === "embedding" ? 1 : 0;
+          const hi = rest[rest.length - 1]?.type === "head" ? rest.length - 1 : rest.length;
+          at = Math.min(hi, Math.max(lo, at));
+          rest.splice(at, 0, ...members);
+          return { blocks: rest, selectedId: members[0].id };
+        }),
+      duplicateGroup: (groupId) =>
+        set((s) => {
+          const idxs = s.blocks.map((b, i) => (s.groupOf[b.id] === groupId ? i : -1)).filter((i) => i >= 0);
+          if (idxs.length === 0) return s;
+          const end = idxs[idxs.length - 1];
+          const members = idxs.map((i) => s.blocks[i]);
+          const copies = members.map((b) => ({ ...b, id: newId() }) as Block);
+          const blocks = s.blocks.slice();
+          blocks.splice(end + 1, 0, ...copies);
+          const newGid = newId();
+          const groupOf = { ...s.groupOf };
+          for (const c of copies) groupOf[c.id] = newGid;
+          const original = s.groups.find((g) => g.id === groupId);
+          const groups = [...s.groups, { id: newGid, label: uniqueLabel(original?.label ?? "Transformer Block", s.groups) }];
+          return { blocks, groupOf, groups, selectedId: copies[0].id };
+        }),
+      removeGroup: (groupId) =>
+        set((s) => {
+          const gone = new Set(s.blocks.filter((b) => s.groupOf[b.id] === groupId).map((b) => b.id));
+          const blocks = s.blocks.filter((b) => !gone.has(b.id));
+          const groupOf = { ...s.groupOf };
+          for (const id of gone) delete groupOf[id];
+          const groups = s.groups.filter((g) => g.id !== groupId);
+          return { blocks, groupOf, groups, selectedId: s.selectedId && gone.has(s.selectedId) ? null : s.selectedId };
+        }),
+      ungroup: (groupId) =>
+        set((s) => {
+          const groupOf = { ...s.groupOf };
+          for (const b of s.blocks) if (groupOf[b.id] === groupId) delete groupOf[b.id];
+          const groups = s.groups.filter((g) => g.id !== groupId);
+          return { groupOf, groups };
+        }),
+      renameGroup: (groupId, label) => set((s) => ({ groups: s.groups.map((g) => (g.id === groupId ? { ...g, label } : g)) })),
       updateBlock: (id, patch) => set((s) => ({ blocks: s.blocks.map((b) => (b.id === id ? ({ ...b, ...patch } as Block) : b)) })),
       select: (selectedId) => set({ selectedId }),
       hover: (hoverId) => set({ hoverId }),
@@ -230,19 +423,55 @@ export const useStudio = create<Studio>()(
 
       splitPct: 48,
       setSplit: (splitPct) => set({ splitPct: Math.min(75, Math.max(25, splitPct)) }),
+
+      rightTab: "observe",
+      setRightTab: (rightTab) => set({ rightTab }),
+      learnBlockId: null,
+      openLearn: (learnBlockId) => set({ rightTab: "learn", learnBlockId, mobilePane: "right" }),
+      codeMode: "model",
+      setCodeMode: (codeMode) => set({ codeMode }),
+      codeBlockId: null,
+      openBlockCode: (codeBlockId) => set({ rightTab: "code", codeMode: "block", codeBlockId, mobilePane: "right" }),
+      playgroundCode: {},
+      setPlaygroundCode: (blockId, code) => set((s) => ({ playgroundCode: { ...s.playgroundCode, [blockId]: code } })),
+      resetPlaygroundCode: (blockId) =>
+        set((s) => {
+          const next = { ...s.playgroundCode };
+          delete next[blockId];
+          return { playgroundCode: next };
+        }),
+      mobilePane: "build",
+      setMobilePane: (mobilePane) => set({ mobilePane }),
+
+      llm: DEFAULT_LLM,
+      setLlm: (p) => set((s) => ({ llm: { ...s.llm, ...p } })),
+      learnChat: [],
+      learnChatBusy: false,
+      pushLearnMsg: (m) => set((s) => ({ learnChat: [...s.learnChat, m] })),
+      updateLearnMsg: (id, patch) => set((s) => ({ learnChat: s.learnChat.map((m) => (m.id === id ? { ...m, ...patch } : m)) })),
+      clearLearnChat: () => set({ learnChat: [] }),
+      setLearnChatBusy: (learnChatBusy) => set({ learnChatBusy }),
+      settingsOpen: false,
+      setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     }),
     {
       name: "mb.studio.v1",
-      version: 2,
-      // v1 defaulted to 60 merges, which leaves most words as single letters
+      version: 3,
       migrate: (persisted, from) => {
-        const p = persisted as Persisted;
-        return from < 2 && p.merges === 60 ? { ...p, merges: DEFAULT_MERGES } : p;
+        let p = persisted as Persisted;
+        // v1 defaulted to 60 merges, which leaves most words as single letters
+        if (from < 2 && p.merges === 60) p = { ...p, merges: DEFAULT_MERGES };
+        // v2 predates group containers — backfill by pattern-detecting existing [Attention, Ffn] pairs
+        if (from < 3 && !p.groups) p = { ...p, ...seedGroups(p.blocks ?? []) };
+        return p;
       },
       partialize: (s) => ({
         blocks: s.blocks,
+        groups: s.groups,
+        groupOf: s.groupOf,
         merges: s.merges,
         usePasted: s.usePasted,
+        llm: s.llm,
         probe: s.probe,
         hyper: s.hyper,
         splitPct: s.splitPct,
@@ -251,7 +480,15 @@ export const useStudio = create<Studio>()(
       }),
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<Studio>;
-        return { ...current, ...p, hyper: { ...current.hyper, ...(p.hyper ?? {}) }, text: p.text ?? current.text };
+        return {
+          ...current,
+          ...p,
+          hyper: { ...current.hyper, ...(p.hyper ?? {}) },
+          llm: { ...current.llm, ...(p.llm ?? {}) },
+          text: p.text ?? current.text,
+          groups: p.groups ?? current.groups,
+          groupOf: p.groupOf ?? current.groupOf,
+        };
       },
     },
   ),

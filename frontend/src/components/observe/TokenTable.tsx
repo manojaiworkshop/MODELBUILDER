@@ -36,7 +36,10 @@ export function TokenTable() {
         {tokens.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
             <span>{probe.length} chars</span> <ArrowRight size={12} /> <span className="font-medium text-fg">{tokens.length} tokens</span> <ArrowRight size={12} />
-            <span>{inspect?.layers[0]?.act.cols ?? "?"}-dim vectors</span>
+            <span>
+              {embed?.outShape[1] ?? "?"}-dim vectors
+              {embed && embed.outShape[1] > embed.act.cols && <span className="text-muted/70"> ({embed.act.cols} shown below)</span>}
+            </span>
             {inspect && tokens.length >= 32 && <Badge tone="warn">probe capped at 32 tokens</Badge>}
           </div>
         )}

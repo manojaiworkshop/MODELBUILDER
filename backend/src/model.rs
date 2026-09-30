@@ -28,7 +28,10 @@ use burn::tensor::activation::{gelu_approximate, relu, silu, softmax};
 use burn::tensor::backend::AutodiffBackend;
 
 const EPS: f64 = 1e-6;
-const MAX_HEAT_COLS: usize = 32;
+// Below this, a layer's activation heatmap shows every dim exactly; above it, evenly-sampled
+// columns stand in for the rest — a canvas this wide (~stretched over a few hundred CSS px)
+// stops letting a human see or hover individual columns well past this width anyway.
+const MAX_HEAT_COLS: usize = 128;
 
 fn linear<B: Backend>(i: usize, o: usize, device: &B::Device) -> Linear<B> {
     LinearConfig::new(i, o).with_bias(false).init(device)

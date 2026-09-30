@@ -1,6 +1,6 @@
 "use client";
 import { Eye, Hammer } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useBackendSync } from "@/lib/sync";
 import { useStudio } from "@/lib/store";
 import { BuildPanel } from "./build/BuildPanel";
@@ -12,7 +12,8 @@ function Layout() {
   useBackendSync();
   const splitPct = useStudio((s) => s.splitPct);
   const setSplit = useStudio((s) => s.setSplit);
-  const [tab, setTab] = useState<"build" | "observe">("build");
+  const tab = useStudio((s) => s.mobilePane);
+  const setTab = useStudio((s) => s.setMobilePane);
   const box = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
 
@@ -47,12 +48,12 @@ function Layout() {
         >
           <span className="h-10 w-0.5 rounded-full bg-border-strong group-hover:bg-accent" />
         </div>
-        <section aria-label="Live code and observe" className={cn("min-h-0 min-w-0 flex-1", tab === "observe" ? "flex flex-col" : "hidden lg:flex lg:flex-col")}>
+        <section aria-label="Live code and observe" className={cn("min-h-0 min-w-0 flex-1", tab === "right" ? "flex flex-col" : "hidden lg:flex lg:flex-col")}>
           <RightPanel />
         </section>
       </div>
       <nav className="grid shrink-0 grid-cols-2 border-t border-border bg-surface lg:hidden" aria-label="Switch panel">
-        {([["build", "Build", Hammer], ["observe", "Observe", Eye]] as const).map(([id, label, Icon]) => (
+        {([["build", "Build", Hammer], ["right", "Observe", Eye]] as const).map(([id, label, Icon]) => (
           <button key={id} onClick={() => setTab(id)} aria-current={tab === id} className={cn("flex items-center justify-center gap-2 py-3 text-sm font-medium", tab === id ? "text-accent" : "text-muted")}>
             <Icon size={16} /> {label}
           </button>

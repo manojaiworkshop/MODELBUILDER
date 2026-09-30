@@ -23,6 +23,7 @@ encoding_rs = "0.8"          # UTF-16 / windows-1252 / … -> UTF-8
 flate2 = "1"                 # .gz
 rayon = "1"                  # parallel tokenization of huge corpora
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }   # Learn tab -> user-configured chat endpoint
 
 # CPU-only training engine: tensors + autograd, pure Rust.
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }

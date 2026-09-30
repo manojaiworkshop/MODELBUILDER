@@ -1,20 +1,22 @@
 "use client";
-import { Activity, Code2 } from "lucide-react";
-import { useState } from "react";
+import { Activity, BookOpen, Code2 } from "lucide-react";
 import { useStudio } from "@/lib/store";
-import { CodePanel } from "./build/CodePanel";
+import { LiveCodeTab } from "./build/CodePanel";
+import { InfoPanel } from "./info/InfoPanel";
 import { ObservePanel } from "./observe/ObservePanel";
 import { cn } from "./ui/kit";
 
-type Tab = "code" | "observe";
+type Tab = "observe" | "code" | "learn";
 
-/** The right-hand column: live-generated code and the training/behaviour view, as two tabs. */
+/** The right-hand column: behaviour, live-generated code, and the concepts/formulas behind each block — as tabs. */
 export function RightPanel() {
-  const [tab, setTab] = useState<Tab>("observe");
+  const tab = useStudio((s) => s.rightTab);
+  const setTab = useStudio((s) => s.setRightTab);
   const nBlocks = useStudio((s) => s.blocks.length);
   const tabs: { id: Tab; label: string; icon: typeof Code2 }[] = [
-    { id: "observe", label: "Observe", icon: Activity },
+    { id: "learn", label: "Learn", icon: BookOpen },
     { id: "code", label: "Live code", icon: Code2 },
+    { id: "observe", label: "Observe", icon: Activity },
   ];
   return (
     <div className="flex h-full min-h-0 flex-col bg-bg">
@@ -36,12 +38,15 @@ export function RightPanel() {
           </button>
         ))}
       </div>
-      {/* both stay mounted so scroll position and the code panel's language choice survive switching */}
+      {/* all three stay mounted so scroll position, the code panel's language, and which block Learn is showing survive switching */}
       <div className={cn("min-h-0 flex-1 flex-col", tab === "observe" ? "flex" : "hidden")}>
         <ObservePanel />
       </div>
+      <div className={cn("min-h-0 flex-1 flex-col", tab === "learn" ? "flex" : "hidden")}>
+        <InfoPanel />
+      </div>
       <div className={cn("min-h-0 flex-1 flex-col", tab === "code" ? "flex" : "hidden")}>
-        <CodePanel />
+        <LiveCodeTab />
       </div>
     </div>
   );
