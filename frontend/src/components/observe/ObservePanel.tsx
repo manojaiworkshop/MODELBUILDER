@@ -8,6 +8,7 @@ import { GradientFlow } from "./GradientFlow";
 import { MiniStatus, TrainingCard } from "./Metrics";
 import { NetworkFlow } from "./NetworkFlow";
 import { TokenTable } from "./TokenTable";
+import { TrainSourceBar } from "./TrainSourceBar";
 
 function ErrorBanner() {
   const status = useStudio((s) => s.status);
@@ -56,6 +57,7 @@ export function ObservePanel() {
       </div>
       <div className="@container min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         <ErrorBanner />
+        <TrainSourceBar />
         <Steps />
         <TokenTable />
         <TrainingCard />

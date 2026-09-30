@@ -5,23 +5,28 @@
 //!   data:remove     {id}                        -> {ok}
 //!   data:toggle     {id, enabled}               -> {ok}
 //!   model:inspect   {spec, probe, seqLen}       -> InspectPayload
-//!   train:start     {spec, hyper, probe}        -> {ok, error?}
+//!   train:start     {spec, hyper, probe, source?: text|qa, mode?: new|continue} -> {ok, error?}
 //!   train:stop      -                           -> {ok}
 //!   probe:set       {text}                      -> {ok}
 //!   generate        {prompt, maxNew, ...}       -> {ok, text?, error?}   (+ streams `generate:token`)
 //!   generate:stop   -                           -> {ok}
+//!   qa:pages        {id}                        -> {ok, pages, synthetic, truncated}
+//!   qa:generate     {llm, id, pages, perPage, concurrency} -> {ok}   (progress: qa:progress, qa:added)
+//!   qa:stop         -                           -> {ok}
+//!   qa:remove       {ids?}                      -> {ok}   (no ids = all; then qa:list)
 //!   learn:ask       {llm, block?, history, question} -> {ok, answer?: LearnAnswer, error?}
 //!   learn:test      {llm}                       -> {ok, models?: [string], error?}
 //! server -> client (pushed):
-//!   data:docs, data:progress, data:info,
+//!   data:docs, data:progress, data:info, qa:list, qa:added, qa:progress,
 //!   train:status, train:steps, train:eval, train:inspect, train:sample, generate:token
 //! Files themselves are uploaded over HTTP (see upload.rs), not through the socket.
 
 use crate::events::*;
 use crate::inspect::{generate, inspect_model, IB};
 use crate::learn;
+use crate::qa;
 use crate::model::build;
-use crate::session::{DocState, Session, Shared};
+use crate::session::{DocState, QaJob, Session, Shared};
 use crate::spec::analyze;
 use crate::train::{self, Event, Job};
 use burn::backend::ndarray::NdArrayDevice;
@@ -143,7 +148,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                     return InspectPayload::failed(msg, a.issues, a.shapes, a.total_params, cur.bpe.vocab_size(), seq_len);
                 }
                 let fp = req.spec.fingerprint();
-                if let Some(t) = trained.filter(|t| t.fingerprint == fp && t.seq_len == seq_len && t.tok.bpe.vocab_size() == cur.bpe.vocab_size()) {
+                if let Some(t) = trained.filter(|t| t.fingerprint == fp && t.seq_len == seq_len && (t.qa || t.tok.bpe.vocab_size() == cur.bpe.vocab_size())) {
                     return inspect_model(&t.model, &t.tok, &req.probe, &a, seq_len, Some(t.step), true);
                 }
                 let dev = NdArrayDevice::default();
@@ -177,8 +182,46 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             if s.train_cancel.lock().unwrap().is_some() {
                 return ack.send(&fail("A training run is already in progress; stop it first.")).ok().unwrap_or(());
             }
-            let Some(tok) = s.data.lock().await.tok.clone() else {
-                return ack.send(&fail("No dataset loaded yet.")).ok().unwrap_or(());
+            let (tok, init, qa_run) = match req.source {
+                TrainSource::Text => {
+                    if req.mode == TrainMode::Continue {
+                        return ack.send(&fail("Continuing a trained model works with the Q&A dataset. Pick the Q&A dataset, or choose “New model”.")).ok().unwrap_or(());
+                    }
+                    let Some(tok) = s.data.lock().await.tok.clone() else {
+                        return ack.send(&fail("No dataset loaded yet.")).ok().unwrap_or(());
+                    };
+                    (tok, None, false)
+                }
+                TrainSource::Qa => {
+                    let (pairs, merges) = {
+                        let d = s.data.lock().await;
+                        (d.qa.clone(), d.merges)
+                    };
+                    if pairs.is_empty() {
+                        return ack.send(&fail("There are no question-answer pairs yet. Generate some in the Data tab first.")).ok().unwrap_or(());
+                    }
+                    let prior = if req.mode == TrainMode::Continue {
+                        match s.trained.lock().unwrap().clone() {
+                            None => return ack.send(&fail("There is no trained model to continue from. Train once first, or choose “New model”.")).ok().unwrap_or(()),
+                            Some(t) if t.fingerprint != req.spec.fingerprint() || t.seq_len != req.hyper.seq_len => {
+                                return ack
+                                    .send(&fail("The blocks or the context length changed since that model was trained. Continuing needs the same architecture — restore it, or choose “New model”."))
+                                    .ok()
+                                    .unwrap_or(())
+                            }
+                            Some(t) => Some(t),
+                        }
+                    } else {
+                        None
+                    };
+                    let text = qa::format_training_text(&pairs);
+                    let bpe = prior.as_ref().map(|t| t.tok.bpe.clone());
+                    let tok = match tokio::task::spawn_blocking(move || qa::tokenize(&text, bpe, merges)).await {
+                        Ok(t) => Arc::new(t),
+                        Err(e) => return ack.send(&fail(format!("tokenizing the Q&A pairs failed: {e}"))).ok().unwrap_or(()),
+                    };
+                    (tok, prior.map(|t| t.model.clone()), true)
+                }
             };
             let Ok(permit) = shared.trainings.clone().try_acquire_owned() else {
                 return ack.send(&fail("The server is busy with other training runs. Try again in a moment.")).ok().unwrap_or(());
@@ -188,7 +231,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             *s.train_cancel.lock().unwrap() = Some(cancel.clone());
             *s.probe.lock().unwrap() = req.probe.chars().take(500).collect();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-            let job = Job { spec: req.spec, tok, hyper: req.hyper, probe: s.probe.clone(), cancel, tx, trained: s.trained.clone() };
+            let job = Job { spec: req.spec, tok, hyper: req.hyper, probe: s.probe.clone(), cancel, tx, trained: s.trained.clone(), init, qa: qa_run };
 
             // forwarder: channel -> socket
             let (fs, fsock) = (s.clone(), sock.clone());
@@ -273,6 +316,96 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             if let Some(c) = s.gen_cancel.lock().unwrap().as_ref() {
                 c.store(true, Ordering::Relaxed);
             }
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------- qa
+    {
+        let s = s.clone();
+        socket.on("qa:pages", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: QaPagesReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
+            let Some(doc) = doc else {
+                return ack.send(&fail("That document isn't ready (or was removed).")).ok().unwrap_or(());
+            };
+            let Some(path) = doc.text_path.clone() else {
+                return ack.send(&fail("That document has no readable text.")).ok().unwrap_or(());
+            };
+            match tokio::task::spawn_blocking(move || qa::list_pages(&path, &doc.pages, doc.text_bytes)).await {
+                Ok(Ok(l)) => ack.send(&json!({ "ok": true, "pages": l.pages, "synthetic": l.synthetic, "truncated": l.truncated })).ok(),
+                Ok(Err(e)) => ack.send(&fail(format!("Could not read the document: {e}"))).ok(),
+                Err(e) => ack.send(&fail(format!("listing pages crashed: {e}"))).ok(),
+            };
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("qa:generate", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: QaGenerateReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.pages.is_empty() || req.pages.len() > 5000 {
+                return ack.send(&fail("Select between 1 and 5000 pages.")).ok().unwrap_or(());
+            }
+            if !(1..=qa::MAX_PER_PAGE).contains(&req.per_page) {
+                return ack.send(&fail(format!("Questions per page must be 1..{}.", qa::MAX_PER_PAGE))).ok().unwrap_or(());
+            }
+            if !(1..=16).contains(&req.concurrency) {
+                return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
+            }
+            let l = &req.llm;
+            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            }
+            let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
+            let Some(doc) = doc else {
+                return ack.send(&fail("That document isn't ready (or was removed).")).ok().unwrap_or(());
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.qa_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A Q&A generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            let mut pages = req.pages;
+            pages.sort_unstable();
+            pages.dedup();
+            s.spawn_qa(QaJob { llm: req.llm, pages, per_page: req.per_page, concurrency: req.concurrency }, cancel, doc);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("qa:stop", async move |ack: AckSender| {
+            if let Some(c) = s.qa_cancel.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("qa:remove", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: QaRemoveReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            {
+                let mut d = s.data.lock().await;
+                if req.ids.is_empty() {
+                    d.qa.clear();
+                } else {
+                    d.qa.retain(|p| !req.ids.contains(&p.id));
+                }
+            }
+            s.emit_qa_list().await;
             ack.send(&json!({ "ok": true })).ok();
         });
     }

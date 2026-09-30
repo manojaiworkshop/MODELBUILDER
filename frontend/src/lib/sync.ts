@@ -3,7 +3,7 @@ import { useEffect, useRef } from "react";
 import { call, getSocket } from "./backend";
 import { isRunning, useStudio } from "./store";
 import { blockLabel, CATALOG } from "./blocks";
-import type { BuildProgress, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, SamplePayload, StatusPayload, StepPoint } from "./types";
+import type { BuildProgress, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload, StatusPayload, StepPoint } from "./types";
 
 /** Keeps the backend in step with the UI. Mount once. */
 export function useBackendSync() {
@@ -19,6 +19,10 @@ export function useBackendSync() {
       st().setDataInfo(null);
       st().setDocs([]);
       st().setProgress(null);
+      st().setQa([]);
+      st().setQaProgress(null);
+      if (st().trainSource === "qa") st().setTrainSource("text");
+      if (st().trainMode === "continue") st().setTrainMode("new"); // the new session has no earlier weights
     };
     const onDisconnect = () => st().setConn("disconnected");
     const onConnectError = () => st().setConn("disconnected");
@@ -31,6 +35,9 @@ export function useBackendSync() {
       st().setGradSnap(p);
     };
     const onToken = (t: { text: string }) => st().appendGen(t.text);
+    const onQaList = (p: QaPair[]) => st().setQa(p);
+    const onQaAdded = (p: QaPair[]) => st().addQa(p);
+    const onQaProgress = (p: QaProgress) => st().setQaProgress(p);
     const onDocs = (p: { docs: DocInfo[] }) => st().setDocs(p.docs);
     const onProgress = (p: BuildProgress) => st().setProgress(p.stage === "done" ? null : p);
     const onInfo = (p: DataInfo) => {
@@ -52,6 +59,9 @@ export function useBackendSync() {
     s.on("train:inspect", onInspect);
     s.on("generate:token", onToken);
     s.on("data:docs", onDocs);
+    s.on("qa:list", onQaList);
+    s.on("qa:added", onQaAdded);
+    s.on("qa:progress", onQaProgress);
     s.on("data:progress", onProgress);
     s.on("data:info", onInfo);
     if (s.connected) onConnect();
@@ -66,6 +76,9 @@ export function useBackendSync() {
       s.off("train:inspect", onInspect);
       s.off("generate:token", onToken);
       s.off("data:docs", onDocs);
+      s.off("qa:list", onQaList);
+      s.off("qa:added", onQaAdded);
+      s.off("qa:progress", onQaProgress);
       s.off("data:progress", onProgress);
       s.off("data:info", onInfo);
     };
@@ -139,12 +152,55 @@ export async function startTraining() {
   st.resetRun();
   st.setGen({ text: "", error: null });
   try {
-    const res = await call<{ ok: boolean; error?: string }>("train:start", { spec: { blocks: st.blocks }, hyper: st.hyper, probe: st.probe });
+    // "continue" only makes sense for Q&A pairs and when there are weights to build on (the bar shows the same rule)
+    const mode = st.trainSource === "qa" && st.trainMode === "continue" && st.inspect?.trained ? "continue" : "new";
+    let probe = st.probe;
+    if (st.trainSource === "qa") {
+      // sample from a prompt shaped like the training text, so the samples show what it learned
+      const q = st.qa[0]?.question;
+      if (q && !probe.startsWith("Question:")) {
+        probe = `Question: ${q}\nAnswer:`;
+        st.setProbe(probe);
+      }
+    }
+    const res = await call<{ ok: boolean; error?: string }>("train:start", { spec: { blocks: st.blocks }, hyper: st.hyper, probe, source: st.trainSource, mode });
     if (!res.ok) st.setStatus({ state: "error", message: res.error ?? "Could not start training", step: 0, total: 0 });
   } catch (e) {
     st.setStatus({ state: "error", message: (e as Error).message, step: 0, total: 0 });
   }
 }
+
+// ---- Q&A dataset ------------------------------------------------------------
+
+export async function loadQaPages(docId: string): Promise<{ ok: true; list: QaPageList } | { ok: false; error: string }> {
+  try {
+    const res = await call<({ ok: true } & QaPageList) | { ok: false; error: string }>("qa:pages", { id: docId }, 60_000);
+    if (!res.ok) return { ok: false, error: res.error };
+    return { ok: true, list: { pages: res.pages, synthetic: res.synthetic, truncated: res.truncated } };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+export async function generateQa(docId: string, pages: number[], perPage: number, concurrency: number): Promise<string | null> {
+  const st = useStudio.getState();
+  st.setQaProgress({ state: "running", done: 0, total: pages.length, pairs: 0, failed: 0, message: "" });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("qa:generate", { llm: st.llm, id: docId, pages, perPage, concurrency });
+    if (!res.ok) {
+      st.setQaProgress(null);
+      return res.error ?? "Could not start generation.";
+    }
+    return null;
+  } catch (e) {
+    st.setQaProgress(null);
+    return (e as Error).message;
+  }
+}
+
+export const stopQa = () => call("qa:stop").catch(() => {});
+export const removeQa = (ids: number[]) => call("qa:remove", { ids }).catch(() => {});
+export const clearQa = () => call("qa:remove", { ids: [] }).catch(() => {});
 
 export const stopTraining = () => call("train:stop").catch(() => {});
 

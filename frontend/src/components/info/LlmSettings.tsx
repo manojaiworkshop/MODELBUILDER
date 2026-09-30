@@ -9,7 +9,6 @@ import { Button, Field, Modal } from "../ui/kit";
 type TestState = { state: "idle" | "testing" | "ok" | "err"; message?: string };
 
 export function LlmSettingsButton() {
-  const open = useStudio((s) => s.settingsOpen);
   const setOpen = useStudio((s) => s.setSettingsOpen);
   return (
     <>
@@ -21,9 +20,15 @@ export function LlmSettingsButton() {
       >
         <Settings2 size={15} />
       </button>
-      <LlmSettingsModal open={open} onClose={() => setOpen(false)} />
     </>
   );
+}
+
+/** The settings dialog itself; mounted once for the whole app (any panel can open it). */
+export function LlmSettingsHost() {
+  const open = useStudio((s) => s.settingsOpen);
+  const setOpen = useStudio((s) => s.setSettingsOpen);
+  return <LlmSettingsModal open={open} onClose={() => setOpen(false)} />;
 }
 
 export function LlmSettingsModal({ open, onClose }: { open: boolean; onClose: () => void }) {

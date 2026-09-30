@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useBackendSync } from "@/lib/sync";
 import { useStudio } from "@/lib/store";
 import { BuildPanel } from "./build/BuildPanel";
+import { LlmSettingsHost } from "./info/LlmSettings";
 import { RightPanel } from "./RightPanel";
 import { TopBar } from "./TopBar";
 import { cn } from "./ui/kit";
@@ -32,6 +33,7 @@ function Layout() {
   return (
     <div className="flex h-dvh flex-col">
       <TopBar />
+      <LlmSettingsHost />
       <div ref={box} className="flex min-h-0 flex-1 flex-col lg:flex-row" style={{ ["--split" as string]: `${splitPct}%` }}>
         <section aria-label="Build" className={cn("min-h-0 min-w-0 flex-1 lg:w-(--split) lg:flex-none", tab === "build" ? "flex flex-col" : "hidden lg:flex lg:flex-col")}>
           <BuildPanel />

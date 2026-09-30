@@ -19,6 +19,8 @@ const MAX_ZIP_ENTRIES: usize = 50_000;
 const MAX_DEPTH: u32 = 3;
 /// Formats that must be read whole into memory get a size ceiling.
 const MAX_WHOLE_FILE: u64 = 512 * 1024 * 1024;
+/// Page marks kept per document.
+const MAX_PAGES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,11 +86,13 @@ pub struct Sink {
     cap: u64,
     newlines: u8,
     pub truncated: bool,
+    /// Byte offset in the output where each page / slide starts (only for formats that have them).
+    pub pages: Vec<u64>,
 }
 
 impl Sink {
     pub fn create(path: &Path, cap: u64) -> io::Result<Sink> {
-        Ok(Sink { w: BufWriter::with_capacity(1 << 20, File::create(path)?), bytes: 0, cap, newlines: 0, truncated: false })
+        Ok(Sink { w: BufWriter::with_capacity(1 << 20, File::create(path)?), bytes: 0, cap, newlines: 0, truncated: false, pages: Vec::new() })
     }
 
     pub fn push(&mut self, s: &str) -> R<()> {
@@ -123,6 +127,13 @@ impl Sink {
         self.w.write_all(buf.as_bytes())?;
         self.bytes += buf.len() as u64;
         Ok(())
+    }
+
+    /// Records that a new page / slide starts at the current output position.
+    pub fn mark_page(&mut self) {
+        if self.pages.len() < MAX_PAGES {
+            self.pages.push(self.bytes);
+        }
     }
 
     /// Paragraph break (used between documents / slides / sheets).
@@ -240,6 +251,8 @@ pub struct Outcome {
     pub bytes: u64,
     pub truncated: bool,
     pub note: Option<String>,
+    /// Start offset of each page / slide in the extracted text (empty when the format has none).
+    pub pages: Vec<u64>,
 }
 
 struct Ctx<'a> {
@@ -260,6 +273,7 @@ pub fn extract_to(src: &Path, name: &str, out: &Path, tmp: &Path, cap: u64) -> R
     let res = extract_path(&mut cx, src, name, 0);
     let (files, skipped) = (cx.files, std::mem::take(&mut cx.skipped));
     let truncated = sink.truncated;
+    let pages = std::mem::take(&mut sink.pages);
     let bytes = sink.finish().map_err(|e| e.to_string())?;
     match res {
         Ok(()) | Err(Ex::Cap) => {}
@@ -283,7 +297,7 @@ pub fn extract_to(src: &Path, name: &str, out: &Path, tmp: &Path, cap: u64) -> R
     if truncated {
         notes.push("truncated at the size limit".into());
     }
-    Ok(Outcome { kind, bytes, truncated, note: (!notes.is_empty()).then(|| notes.join(" · ")) })
+    Ok(Outcome { kind, bytes, truncated, note: (!notes.is_empty()).then(|| notes.join(" · ")), pages })
 }
 
 fn extract_path(cx: &mut Ctx, path: &Path, name: &str, depth: u32) -> R<()> {
@@ -748,12 +762,24 @@ fn guarded<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Option<T> {
     std::panic::catch_unwind(f).ok()
 }
 
+fn push_pages(sink: &mut Sink, pages: &[String]) -> R<()> {
+    for p in pages {
+        // blank pages keep their number (so page N is the PDF's page N) but add no text
+        sink.mark_page();
+        if !p.trim().is_empty() {
+            sink.push(p)?;
+            sink.break_paragraph()?;
+        }
+    }
+    Ok(())
+}
+
 fn pdf_file(path: &Path, sink: &mut Sink) -> R<()> {
     // 1) the normal route
     let p = path.to_path_buf();
-    let first = guarded(move || pdf_extract::extract_text(&p));
+    let first = guarded(move || pdf_extract::extract_text_by_pages(&p));
     let err = match first {
-        Some(Ok(text)) => return sink.push(&text),
+        Some(Ok(pages)) => return push_pages(sink, &pages),
         Some(Err(e)) => e.to_string(),
         None => "the parser crashed".to_string(),
     };
@@ -761,15 +787,16 @@ fn pdf_file(path: &Path, sink: &mut Sink) -> R<()> {
     let encrypted = find(&bytes, b"/Encrypt").is_some();
     // 2) rebuild a broken cross-reference table and try again
     if let Some(fixed) = repair_pdf(&bytes) {
-        if let Some(Ok(text)) = guarded(move || pdf_extract::extract_text_from_mem(&fixed)) {
-            if !text.trim().is_empty() {
-                return sink.push(&text);
+        if let Some(Ok(pages)) = guarded(move || pdf_extract::extract_text_from_mem_by_pages(&fixed)) {
+            if pages.iter().any(|p| !p.trim().is_empty()) {
+                return push_pages(sink, &pages);
             }
         }
     }
-    // 3) poppler, when available
+    // 3) poppler, when available (pages are separated by form feeds)
     if let Some(text) = pdftotext(path) {
-        return sink.push(&text);
+        let pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
+        return push_pages(sink, &pages);
     }
     if encrypted {
         return msg("This PDF is password-protected.");
@@ -959,6 +986,7 @@ fn pptx(path: &Path, sink: &mut Sink) -> R<()> {
     // pptx tables use a:tc / a:tr
     let tags = Tags { text: Some(b"a:t"), paragraphs: &[b"a:p"], cell: Some(b"a:tc"), row: Some(b"a:tr"), specials };
     for (i, s) in slides.iter().enumerate() {
+        sink.mark_page();
         let slide = zip_entry_reader(&mut z, s)?;
         xml_text(slide, sink, &tags)?;
         // speaker notes for the same slide number, if any

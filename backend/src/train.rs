@@ -38,6 +38,19 @@ pub struct Trained {
     pub seq_len: usize,
     pub step: usize,
     pub tok: Arc<Tokenized>,
+    /// Trained on the Q&A dataset (its vocabulary is its own, not the Data tab's).
+    pub qa: bool,
+}
+
+/// Marks every float parameter as requiring gradients. Weights that come from `from_inner` are
+/// plain (untracked) tensors, so without this a continued run computes no gradients at all and
+/// the loss never moves.
+struct RequireGrad;
+
+impl burn::module::ModuleMapper<TB> for RequireGrad {
+    fn map_float<const D: usize>(&mut self, param: burn::module::Param<Tensor<TB, D>>) -> burn::module::Param<Tensor<TB, D>> {
+        param.set_require_grad(true)
+    }
 }
 
 pub type TrainedSlot = Arc<Mutex<Option<Arc<Trained>>>>;
@@ -50,6 +63,9 @@ pub struct Job {
     pub cancel: Arc<AtomicBool>,
     pub tx: UnboundedSender<Event>,
     pub trained: TrainedSlot,
+    /// Weights to keep training from (`None` = fresh random initialisation).
+    pub init: Option<Model<IB>>,
+    pub qa: bool,
 }
 
 fn lr_at(step: usize, total: usize, base: f64, warmup: usize) -> f64 {
@@ -79,7 +95,7 @@ fn r4(x: f32) -> f32 {
 }
 
 pub fn run(job: Job) {
-    let Job { spec, tok, hyper: h, probe, cancel, tx, trained } = job;
+    let Job { spec, tok, hyper: h, probe, cancel, tx, trained, init, qa } = job;
     let status = |state: &'static str, message: String, step: usize| {
         let _ = tx.send(Event::Status(StatusPayload { state, message, step, total: h.steps }));
     };
@@ -101,9 +117,15 @@ pub fn run(job: Job) {
 
     let device = NdArrayDevice::default();
     <TB as Backend>::seed(&device, h.seed);
-    let mut model: Model<TB> = match build::<TB>(&spec, vocab, h.seq_len, &device) {
-        Ok(m) => m,
-        Err(e) => return status("error", e, 0),
+    let mut model: Model<TB> = match init {
+        Some(m) => {
+            use burn::module::Module;
+            Model::<TB>::from_inner(m).map(&mut RequireGrad)
+        }
+        None => match build::<TB>(&spec, vocab, h.seq_len, &device) {
+            Ok(m) => m,
+            Err(e) => return status("error", e, 0),
+        },
     };
     let mut optim = AdamWConfig::new()
         .with_weight_decay(h.weight_decay)
@@ -127,7 +149,7 @@ pub fn run(job: Job) {
             }
         }
         let _ = tx.send(Event::Inspect(Box::new(payload)));
-        *trained.lock().unwrap() = Some(Arc::new(Trained { model: m.clone(), fingerprint, seq_len: h.seq_len, step, tok: tok.clone() }));
+        *trained.lock().unwrap() = Some(Arc::new(Trained { model: m.clone(), fingerprint, seq_len: h.seq_len, step, tok: tok.clone(), qa }));
     };
 
     let eval = |m: &Model<IB>, step: usize| {
@@ -231,7 +253,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trained: TrainedSlot = Arc::new(Mutex::new(None));
         let hyper = Hyper { steps, batch_size: 8, seq_len: 32, lr: 5e-3, probe_every: 10, eval_every: 20, sample_every: 20, sample_tokens: 20, ..Default::default() };
-        run(Job { spec, tok, hyper, probe: Arc::new(Mutex::new("the quick brown".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: trained.clone() });
+        run(Job { spec, tok, hyper, probe: Arc::new(Mutex::new("the quick brown".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: trained.clone(), init: None, qa: false });
         let mut evs = Vec::new();
         while let Ok(e) = rx.try_recv() {
             evs.push(e);
@@ -269,6 +291,52 @@ mod tests {
         assert!(last_inspect.layers[1].grad_norm.unwrap_or(0.0) > 0.0, "gradient norms must be reported");
         assert!(!last_inspect.map.is_empty());
         assert!(trained.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn continuing_from_trained_weights_starts_at_the_earlier_loss() {
+        let (first_evs, first) = run_job(GEMMA, 60);
+        let end_of_first = first_evs.iter().rev().find_map(|e| if let Event::Eval(p) = e { Some(p.val_loss) } else { None }).unwrap();
+        let t = first.lock().unwrap().clone().unwrap();
+
+        let spec: ModelSpec = serde_json::from_str(GEMMA).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hyper = Hyper { steps: 10, batch_size: 8, seq_len: 32, lr: 1e-4, warmup_steps: 0, probe_every: 5, eval_every: 5, sample_every: 100, sample_tokens: 0, ..Default::default() };
+        run(Job {
+            spec, tok: t.tok.clone(), hyper, probe: Arc::new(Mutex::new("the quick".into())), cancel: Arc::new(AtomicBool::new(false)), tx,
+            trained: Arc::new(Mutex::new(None)), init: Some(t.model.clone()), qa: true,
+        });
+        let mut first_loss = None;
+        while let Ok(e) = rx.try_recv() {
+            if let Event::Steps(p) = e {
+                first_loss.get_or_insert(p[0].loss);
+            }
+        }
+        let first_loss = first_loss.unwrap();
+        assert!(first_loss < end_of_first * 2.0 + 0.5, "continued run should start near where the last one ended ({end_of_first}), not from scratch: {first_loss}");
+    }
+
+    #[test]
+    fn continued_run_actually_updates_the_weights() {
+        let (_, first) = run_job(GEMMA, 30);
+        let t = first.lock().unwrap().clone().unwrap();
+        let spec: ModelSpec = serde_json::from_str(GEMMA).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let other = Arc::new(Tokenized::from_parts(t.tok.bpe.clone(), t.tok.bpe.encode(&"pack my box with five dozen liquor jugs. ".repeat(60)).into_iter().map(|i| i as u16).collect(), 10, 10, vec![1; t.tok.bpe.vocab_size()], false));
+        let hyper = Hyper { steps: 40, batch_size: 8, seq_len: 32, lr: 5e-3, warmup_steps: 0, probe_every: 10, eval_every: 100, sample_every: 100, sample_tokens: 0, ..Default::default() };
+        let cont = Arc::new(Mutex::new(None));
+        run(Job { spec, tok: other, hyper, probe: Arc::new(Mutex::new("pack".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: cont.clone(), init: Some(t.model.clone()), qa: true });
+        let mut losses = vec![];
+        let mut grads = vec![];
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                Event::Steps(p) => losses.extend(p.iter().map(|x| x.loss)),
+                Event::Inspect(p) => grads.extend(p.layers.iter().filter_map(|l| l.grad_norm)),
+                _ => {}
+            }
+        }
+        eprintln!("continue losses first/last: {} -> {}; grad norms: {:?}", losses[0], losses.last().unwrap(), &grads[grads.len().saturating_sub(7)..]);
+        assert!(losses.last().unwrap() < &(losses[0] * 0.7), "loss must fall when continuing on new data: {} -> {}", losses[0], losses.last().unwrap());
     }
 
     #[test]

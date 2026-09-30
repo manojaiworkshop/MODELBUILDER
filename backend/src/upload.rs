@@ -96,7 +96,7 @@ pub async fn upload(State(shared): State<Arc<Shared>>, Query(q): Query<UploadQue
         let mut d = session.data.lock().await;
         d.docs.push(Doc {
             id: id.clone(), name: name.clone(), size: written, state: DocState::Extracting, kind: None, text_bytes: 0,
-            note: None, error: None, enabled: true, text_path: None,
+            note: None, error: None, enabled: true, text_path: None, pages: Vec::new(),
         });
     }
     session.emit_docs().await;

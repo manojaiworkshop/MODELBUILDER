@@ -7,6 +7,7 @@ mod extract;
 mod inspect;
 mod learn;
 mod model;
+mod qa;
 mod server;
 mod session;
 mod spec;

@@ -8,6 +8,8 @@
 use crate::corpus;
 use crate::events::{DataInfo, TokenInfo};
 use crate::extract::{self, Kind};
+use crate::learn::LlmConfig;
+use crate::qa::{self, QaPair};
 use crate::tokenizer::Tokenized;
 use crate::train::TrainedSlot;
 use serde::Serialize;
@@ -19,6 +21,26 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// A request to generate Q&A pairs from some pages of one document.
+pub struct QaJob {
+    pub llm: LlmConfig,
+    /// 1-based page (section) numbers.
+    pub pages: Vec<usize>,
+    pub per_page: usize,
+    pub concurrency: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QaProgress {
+    state: &'static str,
+    done: usize,
+    total: usize,
+    pairs: usize,
+    failed: usize,
+    message: String,
+}
+
 /// Process-wide limits and registries. All sizes are overridable by environment variables.
 pub struct Shared {
     pub trainings: Arc<Semaphore>,
@@ -26,6 +48,8 @@ pub struct Shared {
     pub builds: Arc<Semaphore>,
     /// Concurrent Learn-tab chat requests (each is an outbound HTTP call to a user-configured server).
     pub learns: Arc<Semaphore>,
+    /// Concurrent Q&A-generation model calls across all sessions.
+    pub qa_calls: Arc<Semaphore>,
     /// Shared, connection-pooling client for talking to that server.
     pub http: reqwest::Client,
     pub sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -55,6 +79,7 @@ impl Shared {
             extractions: Arc::new(Semaphore::new(env_u64("MAX_EXTRACTIONS", 2) as usize)),
             builds: Arc::new(Semaphore::new(env_u64("MAX_BUILDS", 2) as usize)),
             learns: Arc::new(Semaphore::new(env_u64("MAX_LEARN_ASKS", 4) as usize)),
+            qa_calls: Arc::new(Semaphore::new(env_u64("MAX_QA_CALLS", 16) as usize)),
             http: reqwest::Client::builder().build().expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
@@ -91,6 +116,8 @@ pub struct Doc {
     pub error: Option<String>,
     pub enabled: bool,
     pub text_path: Option<PathBuf>,
+    /// Start offset of each page / slide in the extracted text (empty for formats without pages).
+    pub pages: Vec<u64>,
 }
 
 #[derive(Serialize)]
@@ -128,13 +155,21 @@ pub struct DataState {
     pub use_pasted: bool,
     pub merges: usize,
     pub tok: Option<Arc<Tokenized>>,
+    /// Generated question-answer pairs (see qa.rs).
+    pub qa: Vec<QaPair>,
     next_id: u32,
+    next_qa_id: u32,
 }
 
 impl DataState {
     pub fn new_id(&mut self) -> String {
         self.next_id += 1;
         format!("d{}", self.next_id)
+    }
+
+    pub fn new_qa_id(&mut self) -> u32 {
+        self.next_qa_id += 1;
+        self.next_qa_id
     }
 }
 
@@ -148,6 +183,7 @@ pub struct Session {
     pub probe: Arc<Mutex<String>>,
     pub train_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub gen_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub qa_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// Bumped on every change that needs a new dataset; a rebuild only finishes if it is still current.
     pub gen: AtomicU64,
     build_cancel: Mutex<Arc<AtomicBool>>,
@@ -171,6 +207,7 @@ impl Session {
             probe: Arc::new(Mutex::new(String::new())),
             train_cancel: Mutex::new(None),
             gen_cancel: Mutex::new(None),
+            qa_cancel: Mutex::new(None),
             gen: AtomicU64::new(0),
             build_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             disk_used: AtomicU64::new(0),
@@ -181,7 +218,7 @@ impl Session {
 
     /// Stop everything and delete this session's files.
     pub fn close(&self) {
-        for slot in [&self.train_cancel, &self.gen_cancel] {
+        for slot in [&self.train_cancel, &self.gen_cancel, &self.qa_cancel] {
             if let Some(c) = slot.lock().unwrap().as_ref() {
                 c.store(true, Ordering::Relaxed);
             }
@@ -249,6 +286,7 @@ impl Session {
                             doc.text_bytes = o.bytes;
                             doc.note = o.note;
                             doc.text_path = Some(out);
+                            doc.pages = o.pages;
                         }
                         Err(e) => {
                             let _ = std::fs::remove_file(&out);
@@ -260,6 +298,109 @@ impl Session {
             }
             s.emit_docs().await;
             s.schedule_rebuild();
+        });
+    }
+
+    pub async fn emit_qa_list(&self) {
+        let d = self.data.lock().await;
+        let _ = self.socket.emit("qa:list", &d.qa);
+    }
+
+    /// Generate Q&A pairs for the chosen pages: one model request per page, up to
+    /// `job.concurrency` at once (and never more than the server-wide limit). Progress is pushed
+    /// as `qa:progress`; new pairs as `qa:added`. Cancelled through `cancel`.
+    pub fn spawn_qa(self: &Arc<Self>, job: QaJob, cancel: Arc<AtomicBool>, doc: Doc) {
+        let s = self.clone();
+        tokio::spawn(async move {
+            let total = job.pages.len();
+            let emit = |state: &'static str, done: usize, pairs: usize, failed: usize, message: String| {
+                let _ = s.socket.emit("qa:progress", &QaProgress { state, done, total, pairs, failed, message });
+            };
+            let (Some(path), total_bytes) = (doc.text_path.clone(), doc.text_bytes) else {
+                emit("error", 0, 0, 0, "That document has no readable text.".into());
+                *s.qa_cancel.lock().unwrap() = None;
+                return;
+            };
+            let ranges = match qa::page_ranges(&path, &doc.pages, total_bytes) {
+                Ok((r, _)) => Arc::new(r),
+                Err(e) => {
+                    emit("error", 0, 0, 0, format!("Could not read the document: {e}"));
+                    *s.qa_cancel.lock().unwrap() = None;
+                    return;
+                }
+            };
+            emit("running", 0, 0, 0, String::new());
+
+            let local = Arc::new(Semaphore::new(job.concurrency.max(1)));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<Vec<(String, String)>, String>)>();
+            for &n in &job.pages {
+                let (local, global, client, llm, cancel, tx) = (local.clone(), s.shared.qa_calls.clone(), s.shared.http.clone(), job.llm.clone(), cancel.clone(), tx.clone());
+                let (ranges, path, name, per_page) = (ranges.clone(), path.clone(), doc.name.clone(), job.per_page);
+                tokio::spawn(async move {
+                    let Ok(_l) = local.acquire_owned().await else { return };
+                    let Ok(_g) = global.acquire_owned().await else { return };
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send((n, Err("cancelled".into())));
+                        return;
+                    }
+                    let res = match ranges.get(n.wrapping_sub(1)) {
+                        None => Err(format!("page {n} does not exist")),
+                        Some(&(a, b)) => match qa::read_range(&path, a, b) {
+                            Err(e) => Err(format!("could not read page {n}: {e}")),
+                            Ok(text) if text.chars().count() < qa::MIN_PAGE_CHARS => Err(format!("page {n} has almost no text")),
+                            Ok(text) => qa::generate_page(&client, &llm, &name, n, &text, per_page).await,
+                        },
+                    };
+                    let _ = tx.send((n, res));
+                });
+            }
+            drop(tx);
+
+            let (mut done, mut pairs, mut failed) = (0usize, 0usize, 0usize);
+            let mut first_err: Option<String> = None;
+            let mut fatal = false;
+            while let Some((n, res)) = rx.recv().await {
+                match res {
+                    Ok(list) => {
+                        let mut added = Vec::new();
+                        {
+                            let mut d = s.data.lock().await;
+                            for (question, answer) in list {
+                                let key = question.to_lowercase();
+                                if d.qa.len() >= qa::MAX_PAIRS || d.qa.iter().any(|p| p.doc_id == doc.id && p.question.to_lowercase() == key) {
+                                    continue;
+                                }
+                                let p = QaPair { id: d.new_qa_id(), doc_id: doc.id.clone(), doc: doc.name.clone(), page: n, question, answer };
+                                d.qa.push(p.clone());
+                                added.push(p);
+                            }
+                        }
+                        pairs += added.len();
+                        let _ = s.socket.emit("qa:added", &added);
+                    }
+                    Err(e) if e == "cancelled" => {}
+                    Err(e) => {
+                        failed += 1;
+                        // a bad key / URL fails every page the same way: stop early
+                        if e.contains("API key") || e.contains("Settings") || e.contains("(404)") {
+                            fatal = true;
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        first_err.get_or_insert(format!("page {n}: {e}"));
+                    }
+                }
+                done += 1;
+                emit("running", done, pairs, failed, first_err.clone().unwrap_or_default());
+            }
+            let stopped = cancel.load(Ordering::Relaxed) && !fatal;
+            {
+                let mut d = s.data.lock().await;
+                d.qa.sort_by(|a, b| (&a.doc_id, a.page, a.id).cmp(&(&b.doc_id, b.page, b.id)));
+            }
+            s.emit_qa_list().await;
+            *s.qa_cancel.lock().unwrap() = None;
+            let state = if fatal { "error" } else if stopped { "stopped" } else { "done" };
+            emit(state, done, pairs, failed, first_err.unwrap_or_default());
         });
     }
 

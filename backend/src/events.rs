@@ -1,5 +1,6 @@
 //! Socket.IO payloads (client <-> server). JSON keys are camelCase for the UI.
 
+use crate::learn::LlmConfig;
 use crate::spec::{Issue, ModelSpec, ShapeInfo};
 use crate::trace::LayerTrace;
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,55 @@ pub struct TrainStartReq {
     pub hyper: Hyper,
     #[serde(default)]
     pub probe: String,
+    /// What to train on: the uploaded / pasted text, or the generated question-answer pairs.
+    #[serde(default)]
+    pub source: TrainSource,
+    /// Start from fresh weights, or keep training the model from the previous run.
+    #[serde(default)]
+    pub mode: TrainMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrainSource {
+    #[default]
+    Text,
+    Qa,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrainMode {
+    #[default]
+    New,
+    Continue,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QaPagesReq {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QaGenerateReq {
+    pub llm: LlmConfig,
+    pub id: String,
+    /// 1-based page (or section) numbers.
+    pub pages: Vec<usize>,
+    #[serde(default = "d_per_page")]
+    pub per_page: usize,
+    #[serde(default = "d_parallel")]
+    pub concurrency: usize,
+}
+fn d_per_page() -> usize { 5 }
+fn d_parallel() -> usize { 4 }
+
+#[derive(Debug, Deserialize)]
+pub struct QaRemoveReq {
+    /// Pair ids to delete; empty = delete all.
+    #[serde(default)]
+    pub ids: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]

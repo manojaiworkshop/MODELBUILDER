@@ -7,6 +7,7 @@ import { SAMPLES } from "@/lib/samples";
 import { useStudio } from "@/lib/store";
 import type { DocInfo, UploadItem } from "@/lib/types";
 import { cancelUpload, MAX_FILE_BYTES, uploadFiles } from "@/lib/upload";
+import { QaCard } from "./QaCard";
 import { Badge, Button, Card, Field, NumberInput, SectionHeader, Toggle, cn } from "../ui/kit";
 
 const TINTS = ["#6366f1", "#0ea5e9", "#14b8a6", "#f59e0b", "#f43f5e", "#8b5cf6"];
@@ -332,6 +333,7 @@ export function DataPanel(): ReactNode {
   return (
     <div className="space-y-4 p-4">
       <SourcesCard />
+      <QaCard />
       <PasteCard />
       <BuildProgressBar />
       <TokenizerCard />

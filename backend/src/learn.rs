@@ -153,18 +153,60 @@ fn friendly_error(base_url: &str, e: &reqwest::Error) -> String {
     }
 }
 
-pub async fn ask(client: &reqwest::Client, req: &AskReq) -> Result<LearnAnswer, String> {
-    let base = req.llm.base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("No model server configured yet — open Settings and set the API base URL.".into());
-    }
-    if req.llm.api_key.trim().is_empty() {
-        return Err("No API key configured yet — open Settings and set one.".into());
-    }
-    if req.llm.model.trim().is_empty() {
-        return Err("No model name configured yet — open Settings and set one.".into());
-    }
+/// Why a chat call failed; `fatal` errors (bad key, wrong URL, missing config) are not worth retrying.
+pub struct LlmErr {
+    pub msg: String,
+    pub fatal: bool,
+}
 
+impl LlmErr {
+    fn fatal(msg: impl Into<String>) -> Self {
+        LlmErr { msg: msg.into(), fatal: true }
+    }
+    fn transient(msg: impl Into<String>) -> Self {
+        LlmErr { msg: msg.into(), fatal: false }
+    }
+}
+
+/// One non-streaming chat completion; returns the assistant message text.
+pub async fn complete(client: &reqwest::Client, llm: &LlmConfig, messages: Vec<serde_json::Value>, timeout: Duration) -> Result<String, LlmErr> {
+    let base = llm.base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(LlmErr::fatal("No model server configured yet — open Settings and set the API base URL."));
+    }
+    if llm.api_key.trim().is_empty() {
+        return Err(LlmErr::fatal("No API key configured yet — open Settings and set one."));
+    }
+    if llm.model.trim().is_empty() {
+        return Err(LlmErr::fatal("No model name configured yet — open Settings and set one."));
+    }
+    let body = serde_json::json!({ "model": llm.model, "stream": false, "messages": messages });
+    let resp = client
+        .post(format!("{base}/chat/completions"))
+        .bearer_auth(&llm.api_key)
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| LlmErr::transient(friendly_error(base, &e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(match status.as_u16() {
+            401 | 403 => LlmErr::fatal("The model server rejected the API key — check it in Settings."),
+            404 => LlmErr::fatal(format!("{base}/chat/completions was not found (404) — check the base URL in Settings.")),
+            _ => LlmErr::transient(format!("The model server returned an error ({status}): {}", text.chars().take(300).collect::<String>())),
+        });
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| LlmErr::transient(format!("The model server's reply wasn't valid JSON: {e}")))?;
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| LlmErr::transient("The model server's reply didn't include a message."))
+}
+
+pub async fn ask(client: &reqwest::Client, req: &AskReq) -> Result<LearnAnswer, String> {
     let mut messages = vec![serde_json::json!({"role": "system", "content": system_prompt()})];
     if let Some(b) = &req.block {
         messages.push(serde_json::json!({"role": "system", "content": block_context_message(b)}));
@@ -178,31 +220,8 @@ pub async fn ask(client: &reqwest::Client, req: &AskReq) -> Result<LearnAnswer, 
     }
     messages.push(serde_json::json!({"role": "user", "content": req.question}));
 
-    let body = serde_json::json!({ "model": req.llm.model, "stream": false, "messages": messages });
-    let resp = client
-        .post(format!("{base}/chat/completions"))
-        .bearer_auth(&req.llm.api_key)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| friendly_error(base, &e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(match status.as_u16() {
-            401 | 403 => "The model server rejected the API key — check it in Settings.".to_string(),
-            404 => format!("{base}/chat/completions was not found (404) — check the base URL in Settings."),
-            _ => format!("The model server returned an error ({status}): {}", text.chars().take(300).collect::<String>()),
-        });
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("The model server's reply wasn't valid JSON: {e}"))?;
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| "The model server's reply didn't include a message.".to_string())?;
-
-    Ok(parse_answer(content))
+    let content = complete(client, &req.llm, messages, Duration::from_secs(120)).await.map_err(|e| e.msg)?;
+    Ok(parse_answer(&content))
 }
 
 /// Quick, unauthenticated-ish reachability check: `GET /models`. Cheap and fast, so Settings can
@@ -272,7 +291,7 @@ fn parse_answer(raw: &str) -> LearnAnswer {
     sanitize(LearnAnswer { text, formulas, diagram, follow_ups })
 }
 
-fn balanced_json_object(s: &str) -> Option<&str> {
+pub(crate) fn balanced_json_object(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     let start = s.find('{')?;
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);

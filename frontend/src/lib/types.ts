@@ -170,6 +170,39 @@ export interface UploadItem {
   state: "queued" | "uploading" | "error";
   error?: string;
 }
+// ------------------------------------------------------------- Q&A dataset
+
+export interface QaPair {
+  id: number;
+  docId: string;
+  doc: string;
+  page: number;
+  question: string;
+  answer: string;
+}
+export interface QaPageInfo {
+  n: number;
+  chars: number;
+  preview: string;
+}
+export interface QaPageList {
+  pages: QaPageInfo[];
+  /** No real pages in this format: these are fixed-size sections. */
+  synthetic: boolean;
+  truncated: boolean;
+}
+export interface QaProgress {
+  state: "running" | "done" | "stopped" | "error";
+  done: number;
+  total: number;
+  pairs: number;
+  failed: number;
+  message: string;
+}
+/** What a training run learns from, and whether it starts from scratch. */
+export type TrainSource = "text" | "qa";
+export type TrainMode = "new" | "continue";
+
 export type RunState = "idle" | "preparing" | "running" | "stopped" | "done" | "error";
 export interface StatusPayload {
   state: RunState;
