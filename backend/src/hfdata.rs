@@ -17,6 +17,7 @@
 
 use crate::qa::QaPair;
 use crate::summarize::SummaryPair;
+use crate::sysone::schema::Sample;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -51,6 +52,10 @@ impl Style {
 pub enum Kind {
     Qa,
     Summary,
+    /// System One samples: unlike Q&A/summary there is no standard alternate schema to translate
+    /// into (SQuAD, Alpaca, …), so this kind ignores `style` and is always plain JSONL of
+    /// `Sample` itself — already a stable, documented shape (see `sysone::schema`).
+    SysOne,
 }
 
 fn jsonl(rows: impl IntoIterator<Item = Value>) -> String {
@@ -285,6 +290,33 @@ pub fn import_summaries(content: &str, style: Style) -> Result<Imported<SumRow>,
     import(content, style, summary_from)
 }
 
+/// Plain JSONL of `Sample` itself — its JSON shape (`state`, `questions`, `targets`, `source`) is
+/// already the canonical format (see `sysone::schema`), so there is no separate "style" to pick.
+pub fn export_sysone(samples: &[Sample]) -> String {
+    jsonl(samples.iter().map(|s| serde_json::to_value(s).unwrap_or(Value::Null)))
+}
+
+/// Parses each record strictly as a `Sample` and validates it; anything that doesn't match (wrong
+/// shape, mismatched question/target kinds, bad probabilities) is silently skipped rather than
+/// failing the whole import — same convention as `import_qa` / `import_summaries`.
+pub fn import_sysone(content: &str) -> Result<(Vec<Sample>, usize), String> {
+    let rows = records(content)?;
+    let mut items = Vec::new();
+    let mut skipped = 0;
+    for r in &rows {
+        match serde_json::from_value::<Sample>(r.clone()).ok().filter(|s| s.validate().is_ok()) {
+            Some(s) => items.push(s),
+            None => skipped += 1,
+        }
+    }
+    if items.is_empty() {
+        let keys = rows.first().and_then(|r| r.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let hint = if keys.is_empty() { String::new() } else { format!(" (first record has: {keys})") };
+        return Err(format!("No valid System One samples found{hint}. Expected {{state, questions, targets}} objects."));
+    }
+    Ok((items, skipped))
+}
+
 // ---------------------------------------------------------------- Parquet
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -377,6 +409,39 @@ mod tests {
             assert_eq!(got.items, vec![(style, ("Long page.".to_string(), "Short.".to_string(), String::new()))], "{style:?}");
             assert_eq!(import_summaries(&export_summaries(&[sum_pair()], style, "").unwrap(), Style::Auto).unwrap().items.len(), 1);
         }
+    }
+
+    #[test]
+    fn sysone_samples_round_trip_and_malformed_lines_are_skipped_not_fatal() {
+        use crate::sysone::schema::{Question, Target};
+        let good = Sample {
+            id: 1,
+            state: "Server is down".into(),
+            questions: vec![Question::Noul { text: "urgent?".into() }],
+            targets: vec![Target::Noul { p: 0.9 }],
+            source: "test".into(),
+        };
+        let exported = export_sysone(&[good.clone()]);
+        let (items, skipped) = import_sysone(&exported).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(items[0].state, "Server is down");
+        assert_eq!(items[0].questions, good.questions);
+        assert_eq!(items[0].targets, good.targets);
+
+        // a line with mismatched question/target kinds (valid JSON, wrong schema) must be
+        // skipped, not fail the batch — syntactically invalid JSON is still a hard error
+        // per-line, same as Q&A/summary import (see `wrong_style_and_bad_files_are_explained`).
+        let mixed = format!("{exported}{{\"state\":\"x\",\"questions\":[{{\"type\":\"noul\",\"text\":\"q\"}}],\"targets\":[{{\"type\":\"choice\",\"probs\":[0.5,0.5]}}]}}\n");
+        let (items, skipped) = import_sysone(&mixed).unwrap();
+        assert_eq!(items.len(), 1, "only the one valid sample should survive");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn empty_or_all_invalid_sysone_input_is_an_error() {
+        assert!(import_sysone("").is_err());
+        assert!(import_sysone("not json\nalso not json").is_err());
     }
 
     #[test]

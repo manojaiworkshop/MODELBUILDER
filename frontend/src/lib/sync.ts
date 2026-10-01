@@ -3,7 +3,10 @@ import { useEffect, useRef } from "react";
 import { backendUrl, call, getSocket } from "./backend";
 import { DEFAULT_TOKENIZER, isRunning, useStudio } from "./store";
 import { blockLabel, CATALOG } from "./blocks";
-import type { BuildProgress, DataStyle, DataInfo, DocInfo, EvalPoint, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload, StatusPayload, StepPoint, SummaryPair, SummaryProgress, TokenizerInfo } from "./types";
+import type {
+  BuildProgress, DataStyle, DataInfo, DocInfo, EvalPoint, HfDatasetInfo, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload,
+  StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneMix, SysOneQuestion, SysOneSample, SysOneStep, TokenizerInfo,
+} from "./types";
 
 /** Keeps the backend in step with the UI. Mount once. */
 export function useBackendSync() {
@@ -26,6 +29,10 @@ export function useBackendSync() {
       st().setSummaryProgress(null);
       if (st().trainSource === "qa" || st().trainSource === "summary") st().setTrainSource("text");
       if (st().trainMode === "continue") st().setTrainMode("new"); // the new session has no earlier weights
+      st().setSysoneSamples([]);
+      st().setSysoneGenProgress(null);
+      st().setSysoneTrained(false); // the new server session has no earlier System One weights either
+      st().setSysoneStatus({ state: "idle", message: "", step: 0, total: 0 });
     };
     const onDisconnect = () => st().setConn("disconnected");
     const onConnectError = () => st().setConn("disconnected");
@@ -44,6 +51,15 @@ export function useBackendSync() {
     const onSummaryList = (p: SummaryPair[]) => st().setSummaries(p);
     const onSummaryAdded = (p: SummaryPair[]) => st().addSummaries(p);
     const onSummaryProgress = (p: SummaryProgress) => st().setSummaryProgress(p);
+    const onSysoneList = (p: SysOneSample[]) => st().setSysoneSamples(p);
+    const onSysoneAdded = (p: SysOneSample[]) => st().addSysoneSamples(p);
+    const onSysoneGenProgress = (p: SysOneGenProgress) => st().setSysoneGenProgress(p);
+    const onSysoneTrainStatus = (p: StatusPayload) => {
+      st().setSysoneStatus(p);
+      if (p.state === "done") st().setSysoneTrained(true);
+    };
+    const onSysoneTrainStep = (p: SysOneStep) => st().pushSysoneStep(p);
+    const onSysoneTrainEval = (p: SysOneEval) => st().pushSysoneEval(p);
     const onDocs = (p: { docs: DocInfo[] }) => st().setDocs(p.docs);
     const onProgress = (p: BuildProgress) => st().setProgress(p.stage === "done" ? null : p);
     const onTokenizer = (p: TokenizerInfo) => st().setTokenizer(p);
@@ -73,6 +89,12 @@ export function useBackendSync() {
     s.on("summarize:list", onSummaryList);
     s.on("summarize:added", onSummaryAdded);
     s.on("summarize:progress", onSummaryProgress);
+    s.on("sysone:list", onSysoneList);
+    s.on("sysone:added", onSysoneAdded);
+    s.on("sysone:progress", onSysoneGenProgress);
+    s.on("sysone:train:status", onSysoneTrainStatus);
+    s.on("sysone:train:step", onSysoneTrainStep);
+    s.on("sysone:train:eval", onSysoneTrainEval);
     s.on("data:progress", onProgress);
     s.on("data:info", onInfo);
     if (s.connected) onConnect();
@@ -94,6 +116,12 @@ export function useBackendSync() {
       s.off("summarize:list", onSummaryList);
       s.off("summarize:added", onSummaryAdded);
       s.off("summarize:progress", onSummaryProgress);
+      s.off("sysone:list", onSysoneList);
+      s.off("sysone:added", onSysoneAdded);
+      s.off("sysone:progress", onSysoneGenProgress);
+      s.off("sysone:train:status", onSysoneTrainStatus);
+      s.off("sysone:train:step", onSysoneTrainStep);
+      s.off("sysone:train:eval", onSysoneTrainEval);
       s.off("data:progress", onProgress);
       s.off("data:info", onInfo);
     };
@@ -262,6 +290,114 @@ export const stopSummarize = () => call("summarize:stop").catch(() => {});
 export const removeSummaries = (ids: number[]) => call("summarize:remove", { ids }).catch(() => {});
 export const clearSummaries = () => call("summarize:remove", { ids: [] }).catch(() => {});
 
+// ---- System One dataset ------------------------------------------------------
+// Page listing is shared with Q&A (`loadQaPages` — it's just the document's page boundaries).
+
+export async function generateSysOne(docId: string, pages: number[], perPage: number, concurrency: number): Promise<string | null> {
+  const st = useStudio.getState();
+  st.setSysoneGenProgress({ state: "running", done: 0, total: pages.length, samples: 0, failed: 0, message: "" });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("sysone:generate", { llm: st.llm, id: docId, pages, perPage, concurrency });
+    if (!res.ok) {
+      st.setSysoneGenProgress(null);
+      return res.error ?? "Could not start generation.";
+    }
+    return null;
+  } catch (e) {
+    st.setSysoneGenProgress(null);
+    return (e as Error).message;
+  }
+}
+
+export const stopSysOneGenerate = () => call("sysone:stop").catch(() => {});
+export const removeSysOne = (ids: number[]) => call("sysone:remove", { ids }).catch(() => {});
+export const clearSysOne = () => call("sysone:remove", { ids: [] }).catch(() => {});
+
+/** No source document: the model invents samples for a domain + free-form seed context. */
+export async function generateSysOneSynthetic(domain: string, context: string, mix: SysOneMix, total: number, perBatch: number, concurrency: number): Promise<string | null> {
+  const st = useStudio.getState();
+  const batches = Math.ceil(total / Math.max(1, perBatch));
+  st.setSysoneGenProgress({ state: "running", done: 0, total: batches, samples: 0, failed: 0, message: "" });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("sysone:generate:synthetic", { llm: st.llm, domain, context, mix, total, perBatch, concurrency });
+    if (!res.ok) {
+      st.setSysoneGenProgress(null);
+      return res.error ?? "Could not start generation.";
+    }
+    return null;
+  } catch (e) {
+    st.setSysoneGenProgress(null);
+    return (e as Error).message;
+  }
+}
+
+// ---- System One training + inference -----------------------------------------
+
+export async function startSysOneTrain() {
+  const st = useStudio.getState();
+  st.resetSysoneRun();
+  st.setSysoneInfer({ answers: null, error: null });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("sysone:train:start", { hyper: st.sysoneHyper });
+    if (!res.ok) st.setSysoneStatus({ state: "error", message: res.error ?? "Could not start training", step: 0, total: 0 });
+  } catch (e) {
+    st.setSysoneStatus({ state: "error", message: (e as Error).message, step: 0, total: 0 });
+  }
+}
+
+export const stopSysOneTrain = () => call("sysone:train:stop").catch(() => {});
+
+export async function inferSysOne(state: string, questions: SysOneQuestion[]): Promise<void> {
+  const st = useStudio.getState();
+  st.setSysoneInfer({ running: true, error: null });
+  try {
+    const res = await call<{ ok: boolean; answers?: SysOneAnswer[]; error?: string }>("sysone:infer", { state, questions });
+    if (res.ok) st.setSysoneInfer({ running: false, answers: res.answers ?? [], error: null });
+    else st.setSysoneInfer({ running: false, error: res.error ?? "Inference failed." });
+  } catch (e) {
+    st.setSysoneInfer({ running: false, error: (e as Error).message });
+  }
+}
+
+// ---- System One: import a real classification dataset from Hugging Face ------
+
+export async function fetchSysOneHfInfo(dataset: string): Promise<{ ok: true; info: HfDatasetInfo } | { ok: false; error: string }> {
+  try {
+    const res = await call<{ ok: boolean; info?: HfDatasetInfo; error?: string }>("sysone:hf:info", { dataset }, 30_000);
+    if (!res.ok || !res.info) return { ok: false, error: res.error ?? "Could not look up that dataset." };
+    return { ok: true, info: res.info };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+export interface SysOneHfImportParams {
+  dataset: string;
+  config: string;
+  split: string;
+  textCol: string;
+  labelCol: string;
+  optionsPerQ: number;
+  total: number;
+  questionText?: string;
+}
+
+export async function importSysOneHf(p: SysOneHfImportParams): Promise<string | null> {
+  const st = useStudio.getState();
+  st.setSysoneGenProgress({ state: "running", done: 0, total: 2, samples: 0, failed: 0, message: `Looking up ${p.dataset}…` });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("sysone:hf:import", p);
+    if (!res.ok) {
+      st.setSysoneGenProgress(null);
+      return res.error ?? "Could not start the import.";
+    }
+    return null;
+  } catch (e) {
+    st.setSysoneGenProgress(null);
+    return (e as Error).message;
+  }
+}
+
 // ---- Tokenizer: built-in BPE or an imported tokenizer.json ----------------------
 
 /** Uploads a Hugging Face tokenizer.json; the backend rebuilds the dataset with it. Returns an error message, or null. */
@@ -281,7 +417,7 @@ export async function importTokenizer(file: File): Promise<string | null> {
 export const resetTokenizer = () => call("tokenizer:default").catch(() => {});
 
 // ---- Hugging Face-style dataset export / import ------------------------------
-export type DatasetKind = "qa" | "summary";
+export type DatasetKind = "qa" | "summary" | "sysone";
 export type ExportStyle = "hf" | "simple" | "instruction" | "chat";
 export type ExportFormat = "jsonl" | "parquet";
 export type ImportStyle = ExportStyle | "auto";

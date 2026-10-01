@@ -139,12 +139,19 @@ pub async fn import_dataset(State(shared): State<Arc<Shared>>, Query(q): Query<I
     let doc_id = format!("import:{name}");
     let (kind, style) = (q.kind, q.style);
 
+    // `QaRow` / `SumRow` are private type aliases in `hfdata`, so the tuple shapes are spelled out here.
+    enum Parsed {
+        Qa(Vec<(crate::hfdata::Style, (String, String, String, String))>),
+        Summary(Vec<(crate::hfdata::Style, (String, String, String))>),
+        SysOne(Vec<crate::sysone::schema::Sample>),
+    }
     let parsed = tokio::task::spawn_blocking(move || match kind {
-        Kind::Qa => hfdata::import_qa(&content, style).map(|i| (i.skipped, Ok(i.items), Err(()))),
-        Kind::Summary => hfdata::import_summaries(&content, style).map(|i| (i.skipped, Err(()), Ok(i.items))),
+        Kind::Qa => hfdata::import_qa(&content, style).map(|i| (i.skipped, Parsed::Qa(i.items))),
+        Kind::Summary => hfdata::import_summaries(&content, style).map(|i| (i.skipped, Parsed::Summary(i.items))),
+        Kind::SysOne => hfdata::import_sysone(&content).map(|(items, skipped)| (skipped, Parsed::SysOne(items))),
     })
     .await;
-    let (skipped, qa_items, sum_items) = match parsed {
+    let (skipped, parsed) = match parsed {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return fail(StatusCode::UNPROCESSABLE_ENTITY, e),
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Reading the file failed."),
@@ -154,31 +161,49 @@ pub async fn import_dataset(State(shared): State<Arc<Shared>>, Query(q): Query<I
     let mut capped = false;
     {
         let mut d = session.data.lock().await;
-        if let Ok(items) = qa_items {
-            for (style, (ctx, question, answer, system)) in items {
-                if d.qa.len() >= crate::qa::MAX_PAIRS {
-                    capped = true;
-                    break;
+        match parsed {
+            Parsed::Qa(items) => {
+                for (style, (ctx, question, answer, system)) in items {
+                    if d.qa.len() >= crate::qa::MAX_PAIRS {
+                        capped = true;
+                        break;
+                    }
+                    let id = d.new_qa_id();
+                    d.qa.push(crate::qa::QaPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, question, answer, context: ctx.into() });
+                    added += 1;
                 }
-                let id = d.new_qa_id();
-                d.qa.push(crate::qa::QaPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, question, answer, context: ctx.into() });
-                added += 1;
             }
-        } else if let Ok(items) = sum_items {
-            for (style, (text, summary, system)) in items {
-                if d.summaries.len() >= crate::summarize::MAX_PAIRS {
-                    capped = true;
-                    break;
+            Parsed::Summary(items) => {
+                for (style, (text, summary, system)) in items {
+                    if d.summaries.len() >= crate::summarize::MAX_PAIRS {
+                        capped = true;
+                        break;
+                    }
+                    let id = d.new_summary_id();
+                    d.summaries.push(crate::summarize::SummaryPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, text, summary });
+                    added += 1;
                 }
-                let id = d.new_summary_id();
-                d.summaries.push(crate::summarize::SummaryPair { id, doc_id: doc_id.clone(), doc: name.clone(), page: 0, style, system, text, summary });
-                added += 1;
+            }
+            Parsed::SysOne(items) => {
+                for mut sample in items {
+                    if d.sysone_samples.len() >= crate::sysone::generate::MAX_SAMPLES {
+                        capped = true;
+                        break;
+                    }
+                    sample.id = d.new_sysone_id();
+                    if sample.source.trim().is_empty() {
+                        sample.source = format!("import:{name}");
+                    }
+                    d.sysone_samples.push(sample);
+                    added += 1;
+                }
             }
         }
     }
     match kind {
         Kind::Qa => session.emit_qa_list().await,
         Kind::Summary => session.emit_summary_list().await,
+        Kind::SysOne => session.emit_sysone_list().await,
     }
     (StatusCode::OK, Json(json!({ "ok": true, "added": added, "skipped": skipped, "capped": capped }))).into_response()
 }
@@ -208,6 +233,7 @@ pub async fn export_dataset(State(shared): State<Arc<Shared>>, Query(q): Query<E
         match q.kind {
             Kind::Qa => (hfdata::export_qa(&d.qa, q.style, &system), d.qa.len(), "qa"),
             Kind::Summary => (hfdata::export_summaries(&d.summaries, q.style, &system), d.summaries.len(), "summary"),
+            Kind::SysOne => (Ok(hfdata::export_sysone(&d.sysone_samples)), d.sysone_samples.len(), "sysone"),
         }
     };
     if count == 0 {

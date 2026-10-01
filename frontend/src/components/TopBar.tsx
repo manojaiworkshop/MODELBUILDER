@@ -2,9 +2,11 @@
 import { Layers3, Moon, Play, Square, Sun } from "lucide-react";
 import { PRESETS } from "@/lib/presets";
 import { isRunning, useStudio } from "@/lib/store";
-import { startTraining, stopTraining } from "@/lib/sync";
+import { startSysOneTrain, startTraining, stopSysOneTrain, stopTraining } from "@/lib/sync";
 import { backendUrl } from "@/lib/backend";
 import { Button, cn, useTheme } from "./ui/kit";
+
+const JEV_PRESET_ID = "jev-sysone";
 
 function ConnPill() {
   const conn = useStudio((s) => s.conn);
@@ -28,7 +30,12 @@ export function TopBar() {
   const status = useStudio((s) => s.status);
   const conn = useStudio((s) => s.conn);
   const blocked = useStudio((s) => !!s.inspect && !s.inspect.ok);
-  const running = isRunning(status);
+  const modelKind = useStudio((s) => s.modelKind);
+  const setModelKind = useStudio((s) => s.setModelKind);
+  const sysoneStatus = useStudio((s) => s.sysoneStatus);
+  const nSysoneSamples = useStudio((s) => s.sysoneSamples.length);
+  const sysone = modelKind === "sysone";
+  const running = sysone ? isRunning(sysoneStatus) : isRunning(status);
 
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-3 sm:px-4">
@@ -48,20 +55,34 @@ export function TopBar() {
           disabled={running}
           value=""
           onChange={(e) => {
+            if (e.target.value === JEV_PRESET_ID) {
+              setModelKind("sysone");
+              return;
+            }
             const p = PRESETS.find((x) => x.id === e.target.value);
-            if (p) setBlocks(p.build());
+            if (p) {
+              setModelKind("causal");
+              setBlocks(p.build());
+            }
           }}
           className="h-8 w-44 rounded-md border border-border bg-surface px-2 text-sm text-fg outline-none focus:border-accent disabled:opacity-50"
         >
           <option value="" disabled>Load…</option>
           {PRESETS.map((p) => <option key={p.id} value={p.id} title={p.blurb}>{p.name}</option>)}
+          <option value={JEV_PRESET_ID} title="System One: a bidirectional decision model — state + typed questions in, calibrated probabilities out. Not a block stack.">
+            JEV model (System One)
+          </option>
         </select>
       </label>
 
       <div className="flex-1" />
       <ConnPill />
       {running ? (
-        <Button variant="danger" onClick={() => stopTraining()}><Square size={14} fill="currentColor" /> Stop</Button>
+        <Button variant="danger" onClick={() => (sysone ? stopSysOneTrain() : stopTraining())}><Square size={14} fill="currentColor" /> Stop</Button>
+      ) : sysone ? (
+        <Button variant="primary" disabled={conn !== "connected" || nSysoneSamples === 0} onClick={() => startSysOneTrain()} title={nSysoneSamples === 0 ? "Generate System One samples in the Data tab first" : "Train the JEV model on your generated samples"}>
+          <Play size={14} fill="currentColor" /> Run
+        </Button>
       ) : (
         <Button variant="primary" disabled={conn !== "connected" || blocked} onClick={() => startTraining()} title={blocked ? "Fix the model errors first" : "Train the model on your text"}>
           <Play size={14} fill="currentColor" /> Run

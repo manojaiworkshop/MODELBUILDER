@@ -9,6 +9,7 @@ import type { DocInfo, UploadItem } from "@/lib/types";
 import { cancelUpload, MAX_FILE_BYTES, uploadFiles } from "@/lib/upload";
 import { QaCard } from "./QaCard";
 import { SummaryCard } from "./SummaryCard";
+import { SysOneCard } from "./SysOneCard";
 import { importTokenizer, resetTokenizer } from "@/lib/sync";
 import { Badge, Button, Card, Field, NumberInput, SectionHeader, Segmented, Toggle, cn } from "../ui/kit";
 
@@ -395,14 +396,21 @@ function TokenizerCard() {
 }
 
 export function DataPanel(): ReactNode {
+  const sysone = useStudio((s) => s.modelKind === "sysone");
   return (
     <div className="space-y-4 p-4">
       <SourcesCard />
-      <QaCard />
-      <SummaryCard />
-      <PasteCard />
-      <BuildProgressBar />
-      <TokenizerCard />
+      {sysone ? (
+        <SysOneCard />
+      ) : (
+        <>
+          <QaCard />
+          <SummaryCard />
+          <PasteCard />
+          <BuildProgressBar />
+          <TokenizerCard />
+        </>
+      )}
     </div>
   );
 }

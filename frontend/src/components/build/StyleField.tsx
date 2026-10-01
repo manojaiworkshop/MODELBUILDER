@@ -1,9 +1,13 @@
 "use client";
-import type { DatasetKind } from "@/lib/sync";
 import type { DataStyle } from "@/lib/types";
 import { Field, SelectInput } from "../ui/kit";
 
-const OPTIONS: Record<DatasetKind, { value: DataStyle; label: string; hint: string }[]> = {
+/** Only Q&A/summary generation has a "style" choice — System One samples have no equivalent
+ * (no standard alternate schema for typed decision questions), so this stays narrower than
+ * `DatasetKind` (which also covers export/import, where sysone is a valid third kind). */
+type StyleableKind = "qa" | "summary";
+
+const OPTIONS: Record<StyleableKind, { value: DataStyle; label: string; hint: string }[]> = {
   qa: [
     { value: "simple", label: "Simple", hint: "Free-form 1–3 sentence answers. Trains on “Question: … Answer: …”." },
     { value: "instruction", label: "Instruction (Alpaca)", hint: "Questions as instructions, full responses. Trains on “### Instruction / ### Input / ### Response”." },
@@ -19,7 +23,7 @@ const OPTIONS: Record<DatasetKind, { value: DataStyle; label: string; hint: stri
 };
 
 /** What the model should write when generating, which also decides how the pairs are laid out for training. */
-export function StyleField({ kind, value, onChange, system, onSystem, disabled }: { kind: DatasetKind; value: DataStyle; onChange: (v: DataStyle) => void; system: string; onSystem: (v: string) => void; disabled?: boolean }) {
+export function StyleField({ kind, value, onChange, system, onSystem, disabled }: { kind: StyleableKind; value: DataStyle; onChange: (v: DataStyle) => void; system: string; onSystem: (v: string) => void; disabled?: boolean }) {
   const opts = OPTIONS[kind];
   return (
     <Field label="Style" help="The format the language model writes in. Training then uses the matching text layout, so the model learns exactly this style.">

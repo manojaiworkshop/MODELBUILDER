@@ -181,6 +181,76 @@ pub struct SummarizeRemoveReq {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SysOneGenerateReq {
+    pub llm: LlmConfig,
+    pub id: String,
+    /// 1-based page (or section) numbers.
+    pub pages: Vec<usize>,
+    #[serde(default = "d_per_sysone_page")]
+    pub per_page: usize,
+    #[serde(default = "d_parallel")]
+    pub concurrency: usize,
+}
+fn d_per_sysone_page() -> usize { 3 }
+
+#[derive(Debug, Deserialize)]
+pub struct SysOneRemoveReq {
+    /// Sample ids to delete; empty = delete all.
+    #[serde(default)]
+    pub ids: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneSynthReq {
+    pub llm: LlmConfig,
+    pub domain: String,
+    pub context: String,
+    pub mix: crate::sysone::generate::QuestionMix,
+    pub total: usize,
+    #[serde(default = "d_per_sysone_batch")]
+    pub per_batch: usize,
+    #[serde(default = "d_parallel")]
+    pub concurrency: usize,
+}
+fn d_per_sysone_batch() -> usize { 5 }
+
+#[derive(Debug, Deserialize)]
+pub struct SysOneHfInfoReq {
+    pub dataset: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneHfImportReq {
+    pub dataset: String,
+    pub config: String,
+    pub split: String,
+    pub text_col: String,
+    pub label_col: String,
+    #[serde(default = "d_options_per_q")]
+    pub options_per_q: usize,
+    pub total: usize,
+    #[serde(default)]
+    pub question_text: String,
+}
+fn d_options_per_q() -> usize { 4 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneTrainStartReq {
+    pub hyper: crate::sysone::train::TrainHyper,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneInferReq {
+    pub state: String,
+    pub questions: Vec<crate::sysone::schema::Question>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GenerateReq {
     pub prompt: String,
     #[serde(default = "d_gen")]

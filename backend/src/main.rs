@@ -14,6 +14,7 @@ mod server;
 mod session;
 mod spec;
 mod summarize;
+mod sysone;
 mod tokenizer;
 mod trace;
 mod train;

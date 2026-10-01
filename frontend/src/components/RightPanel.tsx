@@ -4,6 +4,7 @@ import { useStudio } from "@/lib/store";
 import { LiveCodeTab } from "./build/CodePanel";
 import { InfoPanel } from "./info/InfoPanel";
 import { ObservePanel } from "./observe/ObservePanel";
+import { SysOneObservePanel } from "./observe/SysOneObservePanel";
 import { cn } from "./ui/kit";
 
 type Tab = "observe" | "code" | "learn";
@@ -13,6 +14,7 @@ export function RightPanel() {
   const tab = useStudio((s) => s.rightTab);
   const setTab = useStudio((s) => s.setRightTab);
   const nBlocks = useStudio((s) => s.blocks.length);
+  const sysone = useStudio((s) => s.modelKind === "sysone");
   const tabs: { id: Tab; label: string; icon: typeof Code2 }[] = [
     { id: "learn", label: "Learn", icon: BookOpen },
     { id: "code", label: "Live code", icon: Code2 },
@@ -40,7 +42,7 @@ export function RightPanel() {
       </div>
       {/* all three stay mounted so scroll position, the code panel's language, and which block Learn is showing survive switching */}
       <div className={cn("min-h-0 flex-1 flex-col", tab === "observe" ? "flex" : "hidden")}>
-        <ObservePanel />
+        {sysone ? <SysOneObservePanel /> : <ObservePanel />}
       </div>
       <div className={cn("min-h-0 flex-1 flex-col", tab === "learn" ? "flex" : "hidden")}>
         <InfoPanel />

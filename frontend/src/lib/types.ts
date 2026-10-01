@@ -311,3 +311,112 @@ export interface LearnChatMsg {
   pending?: boolean;
   error?: string;
 }
+
+// ------------------------------------------------------- System One ("JEV model")
+// A Jev-style decision model: reads a state + typed questions, answers all of them with
+// calibrated probabilities in one forward pass. A fixed bidirectional-encoder architecture,
+// not a stack of drag-and-drop blocks, so it has its own config/data/observe UI.
+
+export type SysOneQuestion =
+  | { type: "noul"; text: string }
+  | { type: "choice"; text: string; options: string[] }
+  | { type: "score"; text: string; levels: string[] };
+
+export type SysOneTarget = { type: "noul"; p: number } | { type: "choice"; probs: number[] } | { type: "score"; probs: number[] };
+
+export type SysOneAnswer =
+  | { type: "noul"; p: number; confidence: number }
+  | { type: "choice"; probs: number[]; best: number; confidence: number }
+  | { type: "score"; probs: number[]; score: number; confidence: number };
+
+export interface SysOneSample {
+  id: number;
+  state: string;
+  questions: SysOneQuestion[];
+  targets: SysOneTarget[];
+  source: string;
+}
+
+export interface SysOneGenProgress {
+  state: "running" | "done" | "stopped" | "error";
+  done: number;
+  total: number;
+  samples: number;
+  failed: number;
+  message: string;
+}
+
+/** Target ratio of question types for synthetic generation — weights, not required to sum to 100. */
+export interface SysOneMix {
+  noul: number;
+  choice: number;
+  score: number;
+}
+
+/** Mirrors the Rust `TrainHyper` field-for-field (camelCase on the wire). */
+export interface SysOneHyper {
+  epochs: number;
+  batchSize: number;
+  lr: number;
+  warmupSteps: number;
+  confWeight: number;
+  gradClip: number;
+  seed: number;
+  merges: number;
+  dModel: number;
+  nHeads: number;
+  nKvHeads: number;
+  nLayers: number;
+  dFf: number;
+  dropout: number;
+  maxSeqLen: number;
+}
+
+export interface SysOneStep {
+  step: number;
+  loss: number;
+  noul: number;
+  opt: number;
+  conf: number;
+  lr: number;
+}
+
+export interface SysOneEvalReport {
+  nNoul: number;
+  nChoice: number;
+  nScore: number;
+  noulAcc: number;
+  choiceAcc: number;
+  scoreAcc: number;
+  noulBrier: number;
+  choiceBrier: number;
+  scoreBrier: number;
+  scoreMae: number;
+  probEce: number;
+  confEce: number;
+}
+
+export interface SysOneEval {
+  epoch: number;
+  report: SysOneEvalReport;
+  best: boolean;
+}
+
+// ---------------------------------------------- import a real HF dataset
+
+export interface HfColumn {
+  name: string;
+  dtype: string;
+  /** Present when this is a Hugging Face `ClassLabel` column — the full label vocabulary. */
+  classNames: string[] | null;
+}
+export interface HfSplitInfo {
+  config: string;
+  split: string;
+  numRows: number;
+}
+export interface HfDatasetInfo {
+  dataset: string;
+  splits: HfSplitInfo[];
+  columns: HfColumn[];
+}

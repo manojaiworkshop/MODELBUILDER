@@ -4,6 +4,8 @@ import { useState } from "react";
 import { isRunning, useStudio } from "@/lib/store";
 import { Canvas } from "./Canvas";
 import { DataPanel } from "./DataPanel";
+import { SysOneModelPanel } from "./SysOneModelPanel";
+import { SysOneTrainPanel } from "./SysOneTrainPanel";
 import { TrainPanel } from "./TrainPanel";
 import { cn } from "../ui/kit";
 
@@ -13,9 +15,11 @@ export function BuildPanel() {
   const [tab, setTab] = useState<Tab>("blocks");
   const nBlocks = useStudio((s) => s.blocks.length);
   const locked = useStudio((s) => isRunning(s.status));
+  const sysone = useStudio((s) => s.modelKind === "sysone");
+  const nSamples = useStudio((s) => s.sysoneSamples.length);
   const tabs: { id: Tab; label: string; icon: typeof Layers; count?: number }[] = [
-    { id: "blocks", label: "Model", icon: Layers, count: nBlocks },
-    { id: "data", label: "Data", icon: Database },
+    { id: "blocks", label: "Model", icon: Layers, count: sysone ? undefined : nBlocks },
+    { id: "data", label: "Data", icon: Database, count: sysone ? nSamples : undefined },
     { id: "train", label: "Training", icon: SlidersHorizontal },
   ];
   return (
@@ -40,13 +44,13 @@ export function BuildPanel() {
       </div>
       {/* every tab stays mounted so scroll position / drafts survive switching */}
       <div className={cn("min-h-0 flex-1 flex-col", tab === "blocks" ? "flex" : "hidden")}>
-        <Canvas />
+        {sysone ? <SysOneModelPanel /> : <Canvas />}
       </div>
       <div className={cn("min-h-0 flex-1 overflow-y-auto", tab === "data" ? "block" : "hidden")}>
         <DataPanel />
       </div>
       <div className={cn("min-h-0 flex-1 overflow-y-auto", tab === "train" ? "block" : "hidden")}>
-        <TrainPanel locked={locked} />
+        {sysone ? <SysOneTrainPanel /> : <TrainPanel locked={locked} />}
       </div>
     </div>
   );

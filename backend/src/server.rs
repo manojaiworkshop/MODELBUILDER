@@ -19,6 +19,15 @@
 //!   summarize:generate {llm, id, pages, sentences, concurrency} -> {ok}   (progress: summarize:progress, summarize:added)
 //!   summarize:stop     -                        -> {ok}
 //!   summarize:remove   {ids?}                   -> {ok}   (no ids = all; then summarize:list)
+//!   sysone:generate {llm, id, pages, perPage, concurrency} -> {ok}   (progress: sysone:progress, sysone:added; pages via qa:pages)
+//!   sysone:generate:synthetic {llm, domain, context, mix, total, perBatch, concurrency} -> {ok}  (no source document; same progress/added events)
+//!   sysone:hf:info   {dataset}  -> {ok, info?: HfDatasetInfo, error?}  (columns/splits of a public HF dataset, via datasets-server)
+//!   sysone:hf:import {dataset, config, split, textCol, labelCol, optionsPerQ, total, questionText?} -> {ok}  (same progress/added events; stop via sysone:stop)
+//!   sysone:stop         -                       -> {ok}
+//!   sysone:remove       {ids?}                  -> {ok}   (no ids = all; then sysone:list)
+//!   sysone:train:start  {hyper}                 -> {ok, error?}  (separate pipeline from train:start; pushes sysone:train:*)
+//!   sysone:train:stop   -                       -> {ok}
+//!   sysone:infer        {state, questions}      -> {ok, answers?, error?}  (the last trained System One model, one forward pass)
 //!   GET  /api/export?sid=&kind=&style=&format=jsonl|parquet[&system=] -> file download (see hfdata.rs)
 //!   PUT  /api/import?sid=&kind=&style=&name=  raw JSON / JSONL / Parquet body -> {ok, added, skipped}  (style may be auto; then qa:list / summarize:list)
 //!   learn:ask       {llm, block?, history, question} -> {ok, answer?: LearnAnswer, error?}
@@ -26,6 +35,7 @@
 //! server -> client (pushed):
 //!   data:docs, data:progress, data:info, data:tokenizer, qa:list, qa:added, qa:progress,
 //!   summarize:list, summarize:added, summarize:progress,
+//!   sysone:list, sysone:added, sysone:progress, sysone:train:status, sysone:train:step, sysone:train:eval,
 //!   train:status, train:steps, train:eval, train:inspect, train:sample, generate:token
 //! Files themselves are uploaded over HTTP (see upload.rs), not through the socket.
 
@@ -34,8 +44,9 @@ use crate::inspect::{generate, inspect_model, IB};
 use crate::learn;
 use crate::qa;
 use crate::summarize;
+use crate::sysone;
 use crate::model::build;
-use crate::session::{DocState, QaJob, Session, Shared, SummarizeJob};
+use crate::session::{DocState, QaJob, Session, Shared, SummarizeJob, SysOneGenJob, SysOneHfImportJob, SysOneSynthJob};
 use crate::spec::analyze;
 use crate::train::{self, Event, Job};
 use burn::backend::ndarray::NdArrayDevice;
@@ -558,6 +569,227 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             }
             s.emit_summary_list().await;
             ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+
+    // -------------------------------------------------------------- sysone
+    // Page listing is shared with Q&A (`qa:pages`) — same document page boundaries.
+    {
+        let s = s.clone();
+        socket.on("sysone:generate", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneGenerateReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.pages.is_empty() || req.pages.len() > 5000 {
+                return ack.send(&fail("Select between 1 and 5000 pages.")).ok().unwrap_or(());
+            }
+            if !(1..=sysone::generate::MAX_PER_PAGE).contains(&req.per_page) {
+                return ack.send(&fail(format!("Samples per page must be 1..{}.", sysone::generate::MAX_PER_PAGE))).ok().unwrap_or(());
+            }
+            if !(1..=16).contains(&req.concurrency) {
+                return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
+            }
+            let l = &req.llm;
+            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            }
+            let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
+            let Some(doc) = doc else {
+                return ack.send(&fail("That document isn't ready (or was removed).")).ok().unwrap_or(());
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.sysone_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A System One generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            let mut pages = req.pages;
+            pages.sort_unstable();
+            pages.dedup();
+            s.spawn_sysone_generate(SysOneGenJob { llm: req.llm, pages, per_page: req.per_page, concurrency: req.concurrency }, cancel, doc);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:generate:synthetic", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneSynthReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.domain.trim().is_empty() {
+                return ack.send(&fail("Enter a domain (e.g. \"networking\", \"marketing\").")).ok().unwrap_or(());
+            }
+            if !(1..=sysone::generate::MAX_SYNTH_TOTAL).contains(&req.total) {
+                return ack.send(&fail(format!("Total samples must be 1..{}.", sysone::generate::MAX_SYNTH_TOTAL))).ok().unwrap_or(());
+            }
+            if !(1..=sysone::generate::MAX_PER_BATCH).contains(&req.per_batch) {
+                return ack.send(&fail(format!("Samples per request must be 1..{}.", sysone::generate::MAX_PER_BATCH))).ok().unwrap_or(());
+            }
+            if !(1..=16).contains(&req.concurrency) {
+                return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
+            }
+            let l = &req.llm;
+            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.sysone_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A System One generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            let domain = req.domain.trim().chars().take(200).collect::<String>();
+            let context = req.context.trim().chars().take(4000).collect::<String>();
+            s.spawn_sysone_synth(SysOneSynthJob { llm: req.llm, domain, context, mix: req.mix, total: req.total, per_batch: req.per_batch, concurrency: req.concurrency }, cancel);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:hf:info", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneHfInfoReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.dataset.trim().is_empty() {
+                return ack.send(&fail("Enter a Hugging Face dataset repo id, e.g. \"dair-ai/emotion\".")).ok().unwrap_or(());
+            }
+            match sysone::hfimport::fetch_info(&s.shared.http, req.dataset.trim()).await {
+                Ok(info) => ack.send(&json!({ "ok": true, "info": info })).ok(),
+                Err(e) => ack.send(&fail(e)).ok(),
+            };
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:hf:import", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneHfImportReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.dataset.trim().is_empty() || req.config.trim().is_empty() || req.split.trim().is_empty() {
+                return ack.send(&fail("Pick a dataset, config and split first.")).ok().unwrap_or(());
+            }
+            if req.text_col.trim().is_empty() || req.label_col.trim().is_empty() {
+                return ack.send(&fail("Pick which column is the text and which is the label.")).ok().unwrap_or(());
+            }
+            if !(1..=sysone::hfimport::MAX_ROWS).contains(&req.total) {
+                return ack.send(&fail(format!("Rows to import must be 1..{}.", sysone::hfimport::MAX_ROWS))).ok().unwrap_or(());
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.sysone_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A System One generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            s.spawn_sysone_hf_import(
+                SysOneHfImportJob {
+                    dataset: req.dataset.trim().to_string(),
+                    config: req.config,
+                    split: req.split,
+                    text_col: req.text_col,
+                    label_col: req.label_col,
+                    options_per_q: req.options_per_q,
+                    total: req.total,
+                    question_text: req.question_text,
+                },
+                cancel,
+            );
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:stop", async move |ack: AckSender| {
+            if let Some(c) = s.sysone_cancel.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:remove", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneRemoveReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            {
+                let mut d = s.data.lock().await;
+                if req.ids.is_empty() {
+                    d.sysone_samples.clear();
+                } else {
+                    d.sysone_samples.retain(|p| !req.ids.contains(&p.id));
+                }
+            }
+            s.emit_sysone_list().await;
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        let shared = shared.clone();
+        socket.on("sysone:train:start", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneTrainStartReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if let Err(e) = req.hyper.validate() {
+                return ack.send(&fail(e)).ok().unwrap_or(());
+            }
+            if s.sysone_train_cancel.lock().unwrap().is_some() {
+                return ack.send(&fail("A System One training run is already in progress; stop it first.")).ok().unwrap_or(());
+            }
+            let samples = s.data.lock().await.sysone_samples.clone();
+            if samples.is_empty() {
+                return ack.send(&fail("There are no System One samples yet. Generate some in the Data tab first.")).ok().unwrap_or(());
+            }
+            let Ok(_permit) = shared.trainings.clone().try_acquire_owned() else {
+                return ack.send(&fail("The server is busy with other training runs. Try again in a moment.")).ok().unwrap_or(());
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            *s.sysone_train_cancel.lock().unwrap() = Some(cancel.clone());
+            s.spawn_sysone_train(samples, req.hyper, cancel);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:train:stop", async move |ack: AckSender| {
+            if let Some(c) = s.sysone_train_cancel.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        socket.on("sysone:infer", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneInferReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            let Some(trained) = s.sysone_trained.lock().unwrap().clone() else {
+                return ack.send(&fail("No trained System One model yet — train one first.")).ok().unwrap_or(());
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let device = Default::default();
+                sysone::api::decide::<IB>(&trained.model, &trained.tok, &trained.enc, &device, &req.state, &req.questions)
+            })
+            .await;
+            match result {
+                Ok(Ok(answers)) => ack.send(&json!({ "ok": true, "answers": answers })).ok(),
+                Ok(Err(e)) => ack.send(&fail(e)).ok(),
+                Err(e) => ack.send(&fail(format!("inference crashed: {e}"))).ok(),
+            };
         });
     }
 

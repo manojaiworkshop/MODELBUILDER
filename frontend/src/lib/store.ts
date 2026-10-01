@@ -5,7 +5,11 @@ import { makeBlock, newId } from "./blocks";
 import { PRESETS } from "./presets";
 import { DEFAULT_SAMPLE } from "./samples";
 import { seedGroups, uniqueLabel, type BlockGroup, type GroupMembership } from "./transformerGroups";
-import type { Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, QaPair, QaProgress, SamplePayload, StatusPayload, StepPoint, SummaryPair, SummaryProgress, TokenizerInfo, TrainMode, TrainSource, UploadItem } from "./types";
+import type {
+  Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, QaPair, QaProgress, SamplePayload,
+  StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneHyper, SysOneSample, SysOneStep,
+  TokenizerInfo, TrainMode, TrainSource, UploadItem,
+} from "./types";
 
 /** Enough merges for frequent words to become single tokens on a small corpus. */
 export const DEFAULT_MERGES = 200;
@@ -16,6 +20,13 @@ export const DEFAULT_HYPER: Hyper = {
 };
 
 export const DEFAULT_TOKENIZER: TokenizerInfo = { kind: "default", name: "", model: "", fullVocab: 0 };
+
+/** Mirrors the Rust `TrainHyper::default()` in `backend/src/sysone/train.rs`. */
+export const DEFAULT_SYSONE_HYPER: SysOneHyper = {
+  epochs: 6, batchSize: 16, lr: 5e-4, warmupSteps: 100, confWeight: 0.5, gradClip: 1.0,
+  seed: 42, merges: 200, dModel: 128, nHeads: 4, nKvHeads: 2, nLayers: 4, dFf: 512, dropout: 0.1, maxSeqLen: 256,
+};
+const emptySysoneStatus = (): StatusPayload => ({ state: "idle", message: "", step: 0, total: 0 });
 
 export type Conn = "connecting" | "connected" | "disconnected";
 
@@ -125,6 +136,31 @@ export interface Studio {
   trainMode: TrainMode;
   setTrainSource: (s: TrainSource) => void;
   setTrainMode: (m: TrainMode) => void;
+
+  // ---- System One ("JEV model") — a fixed bidirectional-encoder architecture, not a stack of
+  // drag-and-drop blocks, so it's a separate "kind" of model with its own config/data/observe UI
+  // rather than another entry in `blocks`.
+  modelKind: "causal" | "sysone";
+  setModelKind: (k: Studio["modelKind"]) => void;
+  sysoneSamples: SysOneSample[];
+  sysoneGenProgress: SysOneGenProgress | null;
+  setSysoneSamples: (s: SysOneSample[]) => void;
+  addSysoneSamples: (s: SysOneSample[]) => void;
+  setSysoneGenProgress: (p: SysOneGenProgress | null) => void;
+  sysoneHyper: SysOneHyper;
+  setSysoneHyper: (p: Partial<SysOneHyper>) => void;
+  sysoneStatus: StatusPayload;
+  sysoneSteps: SysOneStep[];
+  sysoneEvals: SysOneEval[];
+  setSysoneStatus: (s: StatusPayload) => void;
+  pushSysoneStep: (s: SysOneStep) => void;
+  pushSysoneEval: (e: SysOneEval) => void;
+  resetSysoneRun: () => void;
+  /** Whether a trained System One model currently exists server-side (survives Observe-tab visits). */
+  sysoneTrained: boolean;
+  setSysoneTrained: (b: boolean) => void;
+  sysoneInfer: { running: boolean; answers: SysOneAnswer[] | null; error: string | null };
+  setSysoneInfer: (p: Partial<Studio["sysoneInfer"]>) => void;
 
   // ---- observation
   inspect: InspectPayload | null;
@@ -425,6 +461,27 @@ export const useStudio = create<Studio>()(
       trainMode: "new",
       setTrainSource: (trainSource) => set({ trainSource }),
       setTrainMode: (trainMode) => set({ trainMode }),
+
+      modelKind: "causal",
+      setModelKind: (modelKind) => set({ modelKind }),
+      sysoneSamples: [],
+      sysoneGenProgress: null,
+      setSysoneSamples: (sysoneSamples) => set({ sysoneSamples }),
+      addSysoneSamples: (p) => set((s) => ({ sysoneSamples: [...s.sysoneSamples, ...p] })),
+      setSysoneGenProgress: (sysoneGenProgress) => set({ sysoneGenProgress }),
+      sysoneHyper: DEFAULT_SYSONE_HYPER,
+      setSysoneHyper: (p) => set((s) => ({ sysoneHyper: { ...s.sysoneHyper, ...p } })),
+      sysoneStatus: emptySysoneStatus(),
+      sysoneSteps: [],
+      sysoneEvals: [],
+      setSysoneStatus: (sysoneStatus) => set({ sysoneStatus }),
+      pushSysoneStep: (step) => set((s) => ({ sysoneSteps: [...s.sysoneSteps, step] })),
+      pushSysoneEval: (e) => set((s) => ({ sysoneEvals: [...s.sysoneEvals, e] })),
+      resetSysoneRun: () => set({ sysoneSteps: [], sysoneEvals: [], sysoneStatus: { state: "preparing", message: "Starting…", step: 0, total: 0 } }),
+      sysoneTrained: false,
+      setSysoneTrained: (sysoneTrained) => set({ sysoneTrained }),
+      sysoneInfer: { running: false, answers: null, error: null },
+      setSysoneInfer: (p) => set((s) => ({ sysoneInfer: { ...s.sysoneInfer, ...p } })),
 
       inspect: null,
       inspectBusy: false,
