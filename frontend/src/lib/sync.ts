@@ -3,7 +3,9 @@ import { useEffect, useRef } from "react";
 import { backendUrl, call, getSocket } from "./backend";
 import { DEFAULT_TOKENIZER, isRunning, useStudio } from "./store";
 import { blockLabel, CATALOG } from "./blocks";
+import { qualifiedToolName } from "./mcp";
 import type {
+  McpServer, McpTool, ToolCallResult,
   BuildProgress, DataStyle, DataInfo, DocInfo, EvalPoint, HfDatasetInfo, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload,
   StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneMix, SysOneQuestion, SysOneSample, SysOneStep, TokenizerInfo,
 } from "./types";
@@ -23,6 +25,7 @@ export function useBackendSync() {
       st().setTokenizer(DEFAULT_TOKENIZER); // the new server session starts with the built-in one
       st().setDocs([]);
       st().setProgress(null);
+      loadMissingMcpTools(); // servers added while the backend was down / outdated get their tools now
       st().setQa([]);
       st().setQaProgress(null);
       st().setSummaries([]);
@@ -309,6 +312,35 @@ export async function generateSysOne(docId: string, pages: number[], perPage: nu
   }
 }
 
+/** Writes tool-calling samples for the picked tools (qualified names), `concurrency` tools at a time. */
+export async function generateToolSamples(picked: string[], perTool: number, distractors: number, concurrency: number): Promise<string | null> {
+  const st = useStudio.getState();
+  const want = new Set(picked);
+  const tools: { name: string; description: string; inputSchema: Record<string, unknown> }[] = [];
+  const catalogue: typeof tools = [];
+  for (const srv of st.mcpServers) {
+    if (!srv.enabled) continue;
+    for (const t of st.mcpTools[srv.id] ?? []) {
+      const def = { name: qualifiedToolName(srv, t), description: t.description ?? "", inputSchema: t.inputSchema };
+      catalogue.push(def);
+      if (want.has(def.name)) tools.push(def);
+    }
+  }
+  if (tools.length === 0) return "Pick at least one tool.";
+  st.setSysoneGenProgress({ state: "running", done: 0, total: tools.length, samples: 0, failed: 0, message: "" });
+  try {
+    const res = await call<{ ok: boolean; error?: string }>("sysone:generate:tools", { llm: st.llm, tools, catalogue, perTool, distractors, concurrency });
+    if (!res.ok) {
+      st.setSysoneGenProgress(null);
+      return res.error ?? "Could not start generation.";
+    }
+    return null;
+  } catch (e) {
+    st.setSysoneGenProgress(null);
+    return (e as Error).message;
+  }
+}
+
 export const stopSysOneGenerate = () => call("sysone:stop").catch(() => {});
 export const removeSysOne = (ids: number[]) => call("sysone:remove", { ids }).catch(() => {});
 export const clearSysOne = () => call("sysone:remove", { ids: [] }).catch(() => {});
@@ -356,6 +388,29 @@ export async function inferSysOne(state: string, questions: SysOneQuestion[]): P
     else st.setSysoneInfer({ running: false, error: res.error ?? "Inference failed." });
   } catch (e) {
     st.setSysoneInfer({ running: false, error: (e as Error).message });
+  }
+}
+
+/** The tools of every enabled MCP server (qualified names), as the backend wants them. */
+export function enabledToolDefs() {
+  const st = useStudio.getState();
+  const defs: { name: string; description: string; inputSchema: Record<string, unknown> }[] = [];
+  for (const srv of st.mcpServers) {
+    if (!srv.enabled) continue;
+    for (const t of st.mcpTools[srv.id] ?? []) defs.push({ name: qualifiedToolName(srv, t), description: t.description ?? "", inputSchema: t.inputSchema });
+  }
+  return defs;
+}
+
+/** Runs the trained System One model on a request: picks a tool and fills in its arguments. */
+export async function callToolWithModel(request: string): Promise<{ ok: true; result: ToolCallResult } | { ok: false; error: string }> {
+  const tools = enabledToolDefs();
+  if (tools.length === 0) return { ok: false, error: "No tools to choose from — connect an MCP server and enable it first." };
+  try {
+    const res = await call<{ ok: true; result: ToolCallResult } | { ok: false; error: string }>("sysone:toolcall", { state: request, tools }, 60_000);
+    return res;
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
   }
 }
 
@@ -558,5 +613,57 @@ export async function testLlmConnection(cfg: LlmConfig): Promise<{ ok: boolean; 
     return await call("learn:test", cfg, 20_000);
   } catch (e) {
     return { ok: false, error: (e as Error).message };
+  }
+}
+
+// ---- Tool-calling dataset: MCP servers ------------------------------------------
+
+const toWire = (s: McpServer) => ({
+  name: s.name,
+  transport: s.transport,
+  command: s.command,
+  args: s.args,
+  env: s.env,
+  cwd: s.cwd || undefined,
+  url: s.url,
+  timeoutSecs: s.timeoutSecs ?? undefined,
+  connectTimeoutSecs: s.connectTimeoutSecs ?? undefined,
+});
+
+/** Connects to an MCP server, lists its tools and stores them. `test` only changes how the result is worded. */
+export async function fetchMcpTools(id: string, mode: "refresh" | "test" = "refresh") {
+  const st = useStudio.getState();
+  const server = st.mcpServers.find((x) => x.id === id);
+  if (!server || st.mcpStatus[id]?.busy) return;
+  st.setMcpStatus(id, { busy: mode, ok: null, message: mode === "test" ? "Connecting…" : "Refreshing tools…" });
+  // the backend enforces the same limits; give its own timeouts room to report first
+  const budgetMs = ((server.connectTimeoutSecs ?? 20) + (server.timeoutSecs ?? 30) + 15) * 1000;
+  try {
+    const res = await call<{ ok: true; tools: McpTool[]; serverName: string | null; serverVersion: string | null; elapsedMs: number } | { ok: false; error: string }>("mcp:tools", toWire(server), budgetMs);
+    if (res.ok) {
+      useStudio.getState().setMcpTools(id, res.tools);
+      const n = res.tools.length;
+      useStudio.getState().setMcpStatus(id, {
+        busy: null,
+        ok: true,
+        message: `${n} tool${n === 1 ? "" : "s"} · ${res.elapsedMs} ms`,
+        serverName: res.serverName,
+        serverVersion: res.serverVersion,
+        elapsedMs: res.elapsedMs,
+      });
+    } else {
+      useStudio.getState().setMcpStatus(id, { busy: null, ok: false, message: res.error });
+    }
+  } catch {
+    // no ack at all: the backend is gone, or is an older build without MCP support
+    useStudio.getState().setMcpStatus(id, { busy: null, ok: false, message: "The backend didn't answer. If you just updated the code, restart the backend (./dev.sh) and press Refresh tools." });
+  }
+}
+
+/** On (re)connect: read the tools of every server that has none yet, one after another. */
+export async function loadMissingMcpTools() {
+  const st = useStudio.getState();
+  for (const srv of st.mcpServers) {
+    if (!useStudio.getState().mcpTools[srv.id]) await fetchMcpTools(srv.id, "refresh");
   }
 }

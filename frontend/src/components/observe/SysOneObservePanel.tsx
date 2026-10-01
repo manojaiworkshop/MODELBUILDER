@@ -1,9 +1,9 @@
 "use client";
-import { Brain, Loader2, Play, Plus, Square, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
-import { inferSysOne, startSysOneTrain, stopSysOneTrain } from "@/lib/sync";
+import { Brain, Check, Copy, Loader2, Play, Plus, Square, Trash2, Undo2, Wrench, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { callToolWithModel, inferSysOne, startSysOneTrain, stopSysOneTrain } from "@/lib/sync";
 import { isRunning, useStudio } from "@/lib/store";
-import type { SysOneQuestion } from "@/lib/types";
+import type { SysOneQuestion, ToolCallResult } from "@/lib/types";
 import { Badge, Button, Card, SectionHeader, cn } from "../ui/kit";
 
 const H = 180;
@@ -19,7 +19,17 @@ function niceMax(v: number) {
  * match the causal model's `LossChart`, so this is its own small SVG rather than a shared one. */
 function SysOneLossChart() {
   const steps = useStudio((s) => s.sysoneSteps);
-  const [w] = useState(520);
+  // fill the card: track the container's width (the SVG is drawn in real pixels)
+  const wrap = useRef<HTMLDivElement>(null);
+  const [w, setW] = useState(520);
+  useEffect(() => {
+    const el = wrap.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setW(Math.max(260, el.clientWidth)));
+    ro.observe(el);
+    setW(Math.max(260, el.clientWidth));
+    return () => ro.disconnect();
+  }, []);
 
   const { path, yMax, xMax, last } = useMemo(() => {
     if (steps.length === 0) return { path: "", yMax: 1, xMax: 1, last: null };
@@ -51,7 +61,7 @@ function SysOneLossChart() {
   const ticksY = [0, 0.5, 1].map((f) => f * yMax);
 
   return (
-    <div className="relative w-full">
+    <div ref={wrap} className="relative w-full">
       <svg width={w} height={H} role="img" aria-label="Training loss over steps" className="max-w-full">
         {ticksY.map((t) => (
           <g key={t}>
@@ -170,10 +180,28 @@ function InferCard() {
   const [state, setState] = useState("");
   const [questions, setQuestions] = useState<DraftQ[]>([{ id: qid++, type: "noul", text: "" }]);
 
+  // Snapshots from before each add / remove (question or option), so "Undo" can bring it back.
+  // Typing in a field is not a step of its own.
+  const [history, setHistory] = useState<DraftQ[][]>([]);
+  const change = (next: (qs: DraftQ[]) => DraftQ[]) => {
+    setHistory((h) => [...h.slice(-29), questions]);
+    setQuestions(next(questions));
+  };
+  const undo = () => {
+    const prev = history.at(-1);
+    if (!prev) return;
+    setHistory((h) => h.slice(0, -1));
+    setQuestions(prev);
+  };
+
   const addQ = (type: SysOneQuestion["type"]) =>
-    setQuestions((qs) => [...qs, type === "noul" ? { id: qid++, type, text: "" } : type === "choice" ? { id: qid++, type, text: "", options: ["", ""] } : { id: qid++, type, text: "", levels: ["low", "high"] }]);
-  const removeQ = (id: number) => setQuestions((qs) => qs.filter((q) => q.id !== id));
+    change((qs) => [...qs, type === "noul" ? { id: qid++, type, text: "" } : type === "choice" ? { id: qid++, type, text: "", options: ["", ""] } : { id: qid++, type, text: "", levels: ["low", "high"] }]);
+  const removeQ = (id: number) => change((qs) => qs.filter((q) => q.id !== id));
   const updateQ = (id: number, patch: Partial<DraftQ>) => setQuestions((qs) => qs.map((q) => (q.id === id ? ({ ...q, ...patch } as DraftQ) : q)));
+  const labelsOf = (q: DraftQ) => (q.type === "choice" ? q.options : q.type === "score" ? q.levels : []);
+  const keyOf = (q: DraftQ) => (q.type === "choice" ? "options" : "levels");
+  const addOption = (q: DraftQ) => change((qs) => qs.map((x) => (x.id === q.id ? ({ ...x, [keyOf(q)]: [...labelsOf(q), ""] } as DraftQ) : x)));
+  const removeOption = (q: DraftQ, i: number) => change((qs) => qs.map((x) => (x.id === q.id ? ({ ...x, [keyOf(q)]: labelsOf(q).filter((_, j) => j !== i) } as DraftQ) : x)));
 
   const ready = state.trim().length > 0 && questions.length > 0 && questions.every((q) => q.text.trim() && (q.type === "noul" || (q.type === "choice" ? q.options : q.levels).every((o) => o.trim())));
 
@@ -211,27 +239,33 @@ function InferCard() {
               </div>
               {(q.type === "choice" || q.type === "score") && (
                 <div className="mt-1.5 flex flex-wrap gap-1.5">
-                  {(q.type === "choice" ? q.options : q.levels).map((o, i) => (
-                    <input
-                      key={i}
-                      value={o}
-                      onChange={(e) => {
-                        const key = q.type === "choice" ? "options" : "levels";
-                        const list = [...(q.type === "choice" ? q.options : q.levels)];
-                        list[i] = e.target.value;
-                        updateQ(q.id, { [key]: list } as Partial<DraftQ>);
-                      }}
-                      placeholder={q.type === "choice" ? `option ${i + 1}` : `level ${i + 1}`}
-                      className="h-7 w-24 rounded border border-border bg-surface px-1.5 text-[11px] outline-none focus:border-accent"
-                    />
+                  {labelsOf(q).map((o, i) => (
+                    <span key={i} className="group relative">
+                      <input
+                        value={o}
+                        onChange={(e) => {
+                          const list = [...labelsOf(q)];
+                          list[i] = e.target.value;
+                          updateQ(q.id, { [keyOf(q)]: list } as Partial<DraftQ>);
+                        }}
+                        placeholder={q.type === "choice" ? `option ${i + 1}` : `level ${i + 1}`}
+                        className="h-7 w-28 rounded border border-border bg-surface pl-1.5 pr-6 text-[11px] outline-none focus:border-accent"
+                      />
+                      <button
+                        onClick={() => removeOption(q, i)}
+                        disabled={labelsOf(q).length <= 2}
+                        aria-label={`Remove ${q.type === "choice" ? "option" : "level"} ${i + 1}`}
+                        title={labelsOf(q).length <= 2 ? "A question needs at least 2" : "Remove"}
+                        className="absolute right-0.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted hover:bg-surface-2 hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-muted"
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
                   ))}
                   <button
-                    onClick={() => {
-                      const key = q.type === "choice" ? "options" : "levels";
-                      const list = [...(q.type === "choice" ? q.options : q.levels), ""];
-                      updateQ(q.id, { [key]: list } as Partial<DraftQ>);
-                    }}
-                    className="flex h-7 items-center gap-1 rounded border border-dashed border-border px-1.5 text-[11px] text-muted hover:border-accent hover:text-accent"
+                    onClick={() => addOption(q)}
+                    disabled={labelsOf(q).length >= 10}
+                    className="flex h-7 items-center gap-1 rounded border border-dashed border-border px-1.5 text-[11px] text-muted hover:border-accent hover:text-accent disabled:opacity-40"
                   >
                     <Plus size={11} /> {q.type === "choice" ? "option" : "level"}
                   </button>
@@ -244,6 +278,7 @@ function InferCard() {
           <Button size="sm" onClick={() => addQ("noul")}><Plus size={12} /> yes/no</Button>
           <Button size="sm" onClick={() => addQ("choice")}><Plus size={12} /> choice</Button>
           <Button size="sm" onClick={() => addQ("score")}><Plus size={12} /> score</Button>
+          <Button size="sm" variant="ghost" disabled={history.length === 0} onClick={undo} title="Undo the last add / remove of a question or option"><Undo2 size={12} /> Undo</Button>
           <span className="flex-1" />
           <Button variant="primary" size="sm" disabled={!ready || infer.running} onClick={ask}>
             {infer.running ? <Loader2 size={12} className="animate-spin" /> : <Brain size={12} />} Decide
@@ -260,12 +295,132 @@ function InferCard() {
   );
 }
 
+/** Request in, tool call out: the trained model picks a tool and fills in its arguments. */
+function ToolCallCard() {
+  const trained = useStudio((s) => s.sysoneTrained);
+  const nTools = useStudio((s) => s.mcpServers.filter((x) => x.enabled).reduce((n, x) => n + (s.mcpTools[x.id]?.length ?? 0), 0));
+  const [request, setRequest] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<ToolCallResult | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  if (!trained) {
+    return (
+      <Card>
+        <SectionHeader title="Call a tool" icon={<Wrench size={16} className="text-accent" />} sub="Train a model on a tool-calling dataset first — then give it a request and it picks the tool and fills in the arguments." />
+      </Card>
+    );
+  }
+
+  const text = result ? `[tool_calls]\n${JSON.stringify(result.toolCalls, null, 2)}` : "";
+
+  async function run() {
+    setBusy(true);
+    setError("");
+    const res = await callToolWithModel(request.trim());
+    setBusy(false);
+    if (res.ok) setResult(res.result);
+    else {
+      setResult(null);
+      setError(res.error);
+    }
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable: the text is selectable */
+    }
+  }
+
+  return (
+    <Card>
+      <SectionHeader title="Call a tool" icon={<Wrench size={16} className="text-accent" />} sub={`The model reads the request, picks one of your ${nTools} enabled tool${nTools === 1 ? "" : "s"}, and fills in its arguments.`} />
+      <div className="space-y-3 px-4 pb-4">
+        <textarea
+          value={request}
+          onChange={(e) => setRequest(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && request.trim() && !busy) run(); }}
+          placeholder="e.g. show me the last 20 IFC tracks, newest first"
+          rows={2}
+          className="w-full resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
+        />
+        <div className="flex items-center gap-2">
+          <Button variant="primary" size="sm" disabled={!request.trim() || busy || nTools === 0} onClick={run}>
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Wrench size={12} />} Call
+          </Button>
+          {nTools === 0 && <span className="text-xs text-warn">Enable an MCP server with tools in the Data tab first.</span>}
+        </div>
+        {error && <p className="text-xs text-danger">{error}</p>}
+
+        {result && (
+          <div className="space-y-3">
+            <div className="relative">
+              <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-surface-2 p-3 pr-16 font-mono text-[11px] leading-snug">{text}</pre>
+              <Button size="sm" className="absolute right-2 top-2" onClick={copy}>{copied ? <Check size={12} /> : <Copy size={12} />} {copied ? "Copied" : "Copy"}</Button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <code className="break-all font-medium">{result.tool}</code>
+              <Badge tone={result.toolConfidence >= 0.6 ? "ok" : "warn"} title="probability of this tool in the “which tool” choice">{pct(result.toolConfidence)} sure</Badge>
+              {result.specificity && <Badge title="how completely the request specifies the call">request: {result.specificity}</Badge>}
+            </div>
+
+            {result.missing.length > 0 && (
+              <p className={cn("rounded-lg border px-3 py-2 text-xs", result.missing.some((m) => m.required) ? "border-warn/40 bg-warn/5 text-warn" : "border-border text-muted")}>
+                Left out — free-text values the model can’t produce yet:{" "}
+                {result.missing.map((m, i) => (
+                  <span key={m.path}>{i > 0 && ", "}<code>{m.path}</code>{m.required && " (required)"}</span>
+                ))}
+                . Add them to the call yourself.
+              </p>
+            )}
+
+            <details>
+              <summary className="cursor-pointer text-xs font-medium text-muted hover:text-fg">Tool candidates ({result.candidates.length})</summary>
+              <table className="mt-1.5 w-full text-left text-xs">
+                <thead><tr className="text-muted"><th className="py-1 pr-3 font-medium">Tool</th><th className="py-1 pr-3 font-medium">Right tool?</th><th className="py-1 font-medium">Choice</th></tr></thead>
+                <tbody>
+                  {result.candidates.slice(0, 8).map((c) => (
+                    <tr key={c.name} className={cn("border-t border-border", c.name === result.tool && "text-accent")}>
+                      <td className="break-all py-1 pr-3 font-mono">{c.name}</td>
+                      <td className="py-1 pr-3 tabular-nums">{pct(c.relevance)}</td>
+                      <td className="py-1 tabular-nums">{c.choice === null ? "—" : pct(c.choice)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+
+            <details>
+              <summary className="cursor-pointer text-xs font-medium text-muted hover:text-fg">Argument decisions ({result.decisions.length})</summary>
+              <ul className="mt-1.5 space-y-1 text-xs">
+                {result.decisions.map((d, i) => (
+                  <li key={i} className={cn(!d.used && "opacity-50")}>
+                    <code>{d.path}</code> <span className="text-muted">{d.question.split(": ")[1] ?? d.question}</span> → <b className="font-medium">{d.answer}</b>{" "}
+                    <span className="tabular-nums text-muted">{pct(d.p)} · confidence {pct(d.confidence)}{!d.used && " · not used"}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 export function SysOneObservePanel() {
   return (
     <div className="space-y-4 overflow-y-auto p-4">
       <StatusCard />
       <EvalsCard />
       <InferCard />
+      <ToolCallCard />
     </div>
   );
 }

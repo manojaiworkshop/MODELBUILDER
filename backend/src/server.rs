@@ -23,6 +23,8 @@
 //!   sysone:generate:synthetic {llm, domain, context, mix, total, perBatch, concurrency} -> {ok}  (no source document; same progress/added events)
 //!   sysone:hf:info   {dataset}  -> {ok, info?: HfDatasetInfo, error?}  (columns/splits of a public HF dataset, via datasets-server)
 //!   sysone:hf:import {dataset, config, split, textCol, labelCol, optionsPerQ, total, questionText?} -> {ok}  (same progress/added events; stop via sysone:stop)
+//!   sysone:generate:tools {llm, tools, catalogue?, perTool, distractors, concurrency} -> {ok}  (tool-calling samples, one task per tool; same progress/added events)
+//!   sysone:toolcall   {state, tools}                -> {ok, result?: {tool, toolConfidence, candidates, specificity, arguments, decisions, missing, toolCalls}}  (last trained System One model: pick a tool and fill its arguments)
 //!   sysone:stop         -                       -> {ok}
 //!   sysone:remove       {ids?}                  -> {ok}   (no ids = all; then sysone:list)
 //!   sysone:train:start  {hyper}                 -> {ok, error?}  (separate pipeline from train:start; pushes sysone:train:*)
@@ -32,6 +34,7 @@
 //!   PUT  /api/import?sid=&kind=&style=&name=  raw JSON / JSONL / Parquet body -> {ok, added, skipped}  (style may be auto; then qa:list / summarize:list)
 //!   learn:ask       {llm, block?, history, question} -> {ok, answer?: LearnAnswer, error?}
 //!   learn:test      {llm}                       -> {ok, models?: [string], error?}
+//!   mcp:tools       {name, transport, command?, args?, env?, cwd?, url?, timeoutSecs?, connectTimeoutSecs?} -> {ok, tools?, serverName?, serverVersion?, elapsedMs?, error?}  (connect, list tools, disconnect)
 //! server -> client (pushed):
 //!   data:docs, data:progress, data:info, data:tokenizer, qa:list, qa:added, qa:progress,
 //!   summarize:list, summarize:added, summarize:progress,
@@ -46,7 +49,7 @@ use crate::qa;
 use crate::summarize;
 use crate::sysone;
 use crate::model::build;
-use crate::session::{DocState, QaJob, Session, Shared, SummarizeJob, SysOneGenJob, SysOneHfImportJob, SysOneSynthJob};
+use crate::session::{DocState, QaJob, Session, Shared, SummarizeJob, SysOneGenJob, SysOneHfImportJob, SysOneSynthJob, SysOneToolGenJob};
 use crate::spec::analyze;
 use crate::train::{self, Event, Job};
 use burn::backend::ndarray::NdArrayDevice;
@@ -652,6 +655,46 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
     }
     {
         let s = s.clone();
+        socket.on("sysone:generate:tools", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneToolGenReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            use sysone::toolgen::{MAX_CATALOGUE, MAX_DISTRACTORS, MAX_PER_TOOL, MAX_TOOLS_PER_RUN};
+            if req.tools.is_empty() || req.tools.len() > MAX_TOOLS_PER_RUN {
+                return ack.send(&fail(format!("Pick between 1 and {MAX_TOOLS_PER_RUN} tools."))).ok().unwrap_or(());
+            }
+            if req.catalogue.len() > MAX_CATALOGUE {
+                return ack.send(&fail(format!("At most {MAX_CATALOGUE} tools can be told apart in one dataset."))).ok().unwrap_or(());
+            }
+            if !(1..=MAX_PER_TOOL).contains(&req.per_tool) {
+                return ack.send(&fail(format!("Samples per tool must be 1..{MAX_PER_TOOL}."))).ok().unwrap_or(());
+            }
+            if req.distractors > MAX_DISTRACTORS {
+                return ack.send(&fail(format!("Other tools to offer must be 0..{MAX_DISTRACTORS}."))).ok().unwrap_or(());
+            }
+            if !(1..=8).contains(&req.concurrency) {
+                return ack.send(&fail("Parallel tools must be 1..8.")).ok().unwrap_or(());
+            }
+            let l = &req.llm;
+            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = s.sysone_cancel.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("A System One generation is already running; stop it first.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            let catalogue = if req.catalogue.is_empty() { req.tools.clone() } else { req.catalogue };
+            s.spawn_sysone_toolgen(SysOneToolGenJob { llm: req.llm, tools: req.tools, catalogue, per_tool: req.per_tool, distractors: req.distractors, concurrency: req.concurrency }, cancel);
+            ack.send(&json!({ "ok": true })).ok();
+        });
+    }
+    {
+        let s = s.clone();
         socket.on("sysone:hf:info", async move |Data(v): Data<Value>, ack: AckSender| {
             let req: SysOneHfInfoReq = match parse(v) {
                 Ok(r) => r,
@@ -793,6 +836,35 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
         });
     }
 
+    {
+        let s = s.clone();
+        socket.on("sysone:toolcall", async move |Data(v): Data<Value>, ack: AckSender| {
+            let req: SysOneToolCallReq = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if req.state.trim().is_empty() {
+                return ack.send(&fail("Type a request first.")).ok().unwrap_or(());
+            }
+            if req.tools.is_empty() || req.tools.len() > sysone::toolgen::MAX_CATALOGUE {
+                return ack.send(&fail(format!("Offer between 1 and {} tools.", sysone::toolgen::MAX_CATALOGUE))).ok().unwrap_or(());
+            }
+            let Some(trained) = s.sysone_trained.lock().unwrap().clone() else {
+                return ack.send(&fail("No trained System One model yet — train one first.")).ok().unwrap_or(());
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let device = Default::default();
+                sysone::toolcall::call_tool::<IB>(&trained.model, &trained.tok, &trained.enc, &device, &req.state, &req.tools)
+            })
+            .await;
+            match result {
+                Ok(Ok(out)) => ack.send(&json!({ "ok": true, "result": out })).ok(),
+                Ok(Err(e)) => ack.send(&fail(e)).ok(),
+                Err(e) => ack.send(&fail(format!("inference crashed: {e}"))).ok(),
+            };
+        });
+    }
+
     // ---------------------------------------------------------------- learn
     {
         let shared = shared.clone();
@@ -825,6 +897,27 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             };
             match learn::list_models(&shared.http, &cfg).await {
                 Ok(models) => ack.send(&json!({ "ok": true, "models": models })).ok(),
+                Err(e) => ack.send(&fail(e)).ok(),
+            };
+        });
+    }
+
+    // ------------------------------------------------------------------ mcp
+    {
+        let shared = shared.clone();
+        socket.on("mcp:tools", async move |Data(v): Data<Value>, ack: AckSender| {
+            let cfg: sysone::mcp::McpServerConfig = match parse(v) {
+                Ok(r) => r,
+                Err(e) => return ack.send(&fail(e)).ok().unwrap_or(()),
+            };
+            if let Err(e) = sysone::mcp::validate(&cfg, shared.mcp_stdio) {
+                return ack.send(&fail(e)).ok().unwrap_or(());
+            }
+            let Ok(_permit) = shared.mcp_conns.clone().try_acquire_owned() else {
+                return ack.send(&fail("Too many MCP connections are open right now — try again in a moment.")).ok().unwrap_or(());
+            };
+            match sysone::mcp::list_tools(&cfg, shared.mcp_stdio).await {
+                Ok(l) => ack.send(&json!({ "ok": true, "tools": l.tools, "serverName": l.server_name, "serverVersion": l.server_version, "elapsedMs": l.elapsed_ms })).ok(),
                 Err(e) => ack.send(&fail(e)).ok(),
             };
         });

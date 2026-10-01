@@ -1,2 +1,50 @@
 fuser -k 4000/tcp     # kill whatever holds port 4000
 ./dev.sh
+
+
+What gets generated: for each tool, the LLM writes realistic user requests and the exact arguments. The arguments are checked against the tool's schema, and any that don't match are dropped. Code then builds the questions, so the targets are exact:
+
+Question	Type
+Which tool fits this request? (right one plus wrong ones)	Choice
+Which value for a fixed-value argument? Which number (1, 5, 10, 20, 50, 100 plus the default and bounds)?	Choice
+Is <tool> the right tool? (asked once for the right tool, once for a wrong one)	Yes/no
+Is an optional argument given? Is a true/false argument true?	Yes/no
+How completely does the request specify the call? (vague, partial, complete)	Score
+Samples: each sample also keeps the full ground-truth call. Samples in the list show it as tool({...arguments}). The new code is in toolgen.rs and SysOneToolsCard.tsx.
+
+Limits to know about:
+
+Free-text arguments: values like an ID or a date copied from the request can't be chosen from a list. They are kept in the stored call but don't become questions yet. Those need the span-extraction question type from my earlier proposal.
+Long samples: tool names are the options, so samples are long. I raised the option label limit from 8 to up to 32 tokens, which only matters when an option is long, such as a tool name. Use a max sequence length of 512.
+Not done yet: turning the trained model's answers back into a tool-call JSON. That is the next step, and the data it needs is already in the samples.
+If you want the next step, I can add a "Call a tool" panel to Ask it that takes a request, runs the model, and returns the tool call in your [tool_calls] format.
+
+
+
+What Laya is
+Laya (also called "System One") is a bidirectional encoder that answers typed questions in one forward pass. Your System One is a port of the same idea, since your code comments say "Jev-style", and the Laya card benchmarks itself against "TypeSafe Jev". The question types are the same: choice, noul (yes/no probability) and score (ordinal).
+
+How it differs from your model
+Laya	Your System One
+Backbone	A pretrained model fine-tuned: ModernBERT-large (28 layers, 1024 wide, 16 heads, about 395M parameters), plus a 2-layer decision head, 421M in total. A multilingual variant uses mmBERT-base (22 layers, 322M).	Trained from scratch: 2–6 layers, d_model 64–256, well under 5M parameters.
+Vocabulary	The pretrained 50k tokenizer (256k for the multilingual one).	A BPE you train yourself on your samples (a few hundred tokens).
+Pretraining	Inherits masked-language pretraining on huge text, so it already understands language.	None. It learns language and the task from a few hundred samples.
+Context	512 tokens per question (192 for the options), 1024 for multilingual, up to 8,192 for long documents.	256–1024, grown automatically.
+Reading answers	Each option is scored at its own [MASK] token, then softmaxed per question.	Each option is scored at its own [OPT] marker token, then softmaxed. It also reads the question marker's state alongside.
+Attention	The backbone's own, alternating full and sliding-window attention.	Your structured mask: state tokens see only the state, each question sees the state and itself, never other questions.
+Question format	Dict of named questions with instructions and criteria (a label → description map). Schema is supplied at request time, no retraining needed.	Question text plus option labels only. No per-option descriptions.
+Confidence	A separate fitted temperature per option type and size. Raw output is over-confident (ECE 0.213, fitted 0.081).	A learned confidence head, plus calibration reported on validation. No temperature fitting step.
+Training	Reinforcement learning (it calls it RLCD), with a strictly proper scoring rule as the reward (log plus spherical, plus ranked probability for ordinal). Training uses REINFORCE with a group-mean baseline (GRPO-style), over multi-turn conversations.	Supervised: cross-entropy against soft targets from an LLM or one-hot labels, plus a confidence loss.
+Compute	Uses a GPU, with 7,313 updates over about 2 hours on one GPU (bf16).	CPU only, in pure Rust.
+Scale	Roughly 39 ms for one question on a T4 GPU, and 100–330 questions per second batched.	Your model is tiny, so it is cheap to run, but far less capable.
+Things worth taking from it
+Start from a pretrained encoder. This is the main difference. Your tool-calling dataset needs the model to understand request wording like "latest 20 rows" or "how many", and 160 samples can't teach language to a model starting from random weights. That is why your validation numbers peak early and then fall. A pretrained backbone fixes most of that. In your Rust and burn stack this means loading a small pretrained encoder, such as MiniLM or a small BERT or ModernBERT, from safetensors. It's a real piece of work: you'd need the exact architecture and the matching tokenizer.
+Option descriptions (criteria). Laya lets each option carry a description. Your tool-calling data already has one, the tool description, but the model never sees it. Adding it to the "which tool" options could help it generalise to new tools.
+Temperature fitting. A single scalar fitted on validation data per question type is a cheap way to fix over-confidence. It needs no retraining.
+Their own stated weaknesses match what you saw. Many options squeeze each label into very few tokens, noul can follow the option labels instead of the request, and score is the weakest type. Their base checkpoints are near chance until fine-tuned on a domain, and fine-tuning is what makes them work.
+I would not copy the reinforcement-learning training. Supervised soft-label training is simpler and works with CPU-only training.
+
+Limits of this comparison
+I only had access to the model card, config and file listing, not the code or weights. Their numbers (for example 0.766 accuracy and the 0.713 benchmark scores) come from the card's own benchmarks and I haven't verified them.
+
+If you want, I can look at what it would take to load a small pretrained encoder into your Rust backend. That is the change most likely to improve your results.

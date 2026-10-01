@@ -6,7 +6,7 @@ import { PRESETS } from "./presets";
 import { DEFAULT_SAMPLE } from "./samples";
 import { seedGroups, uniqueLabel, type BlockGroup, type GroupMembership } from "./transformerGroups";
 import type {
-  Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, QaPair, QaProgress, SamplePayload,
+  Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, McpServer, McpStatus, McpTool, QaPair, QaProgress, SamplePayload,
   StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneHyper, SysOneSample, SysOneStep,
   TokenizerInfo, TrainMode, TrainSource, UploadItem,
 } from "./types";
@@ -23,8 +23,8 @@ export const DEFAULT_TOKENIZER: TokenizerInfo = { kind: "default", name: "", mod
 
 /** Mirrors the Rust `TrainHyper::default()` in `backend/src/sysone/train.rs`. */
 export const DEFAULT_SYSONE_HYPER: SysOneHyper = {
-  epochs: 6, batchSize: 16, lr: 5e-4, warmupSteps: 100, confWeight: 0.5, gradClip: 1.0,
-  seed: 42, merges: 200, dModel: 128, nHeads: 4, nKvHeads: 2, nLayers: 4, dFf: 512, dropout: 0.1, maxSeqLen: 256,
+  epochs: 30, batchSize: 16, lr: 5e-4, warmupSteps: 100, confWeight: 0.5, gradClip: 1.0,
+  seed: 42, merges: 200, dModel: 128, nHeads: 4, nKvHeads: 2, nLayers: 4, dFf: 512, dropout: 0.1, maxSeqLen: 256, device: "cpu",
 };
 const emptySysoneStatus = (): StatusPayload => ({ state: "idle", message: "", step: 0, total: 0 });
 
@@ -142,6 +142,15 @@ export interface Studio {
   // rather than another entry in `blocks`.
   modelKind: "causal" | "sysone";
   setModelKind: (k: Studio["modelKind"]) => void;
+  /** Tool-calling dataset: the MCP servers the user connected, and the tools each one reported. */
+  mcpServers: McpServer[];
+  mcpTools: Record<string, McpTool[]>;
+  mcpStatus: Record<string, McpStatus>;
+  addMcpServer: (s: McpServer) => void;
+  updateMcpServer: (id: string, patch: Partial<McpServer>) => void;
+  removeMcpServer: (id: string) => void;
+  setMcpTools: (id: string, tools: McpTool[]) => void;
+  setMcpStatus: (id: string, s: McpStatus) => void;
   sysoneSamples: SysOneSample[];
   sysoneGenProgress: SysOneGenProgress | null;
   setSysoneSamples: (s: SysOneSample[]) => void;
@@ -464,6 +473,21 @@ export const useStudio = create<Studio>()(
 
       modelKind: "causal",
       setModelKind: (modelKind) => set({ modelKind }),
+      mcpServers: [],
+      mcpTools: {},
+      mcpStatus: {},
+      addMcpServer: (srv) => set((s) => ({ mcpServers: [...s.mcpServers, srv] })),
+      updateMcpServer: (id, patch) => set((s) => ({ mcpServers: s.mcpServers.map((x) => (x.id === id ? { ...x, ...patch } : x)) })),
+      removeMcpServer: (id) =>
+        set((s) => {
+          const mcpTools = { ...s.mcpTools };
+          const mcpStatus = { ...s.mcpStatus };
+          delete mcpTools[id];
+          delete mcpStatus[id];
+          return { mcpServers: s.mcpServers.filter((x) => x.id !== id), mcpTools, mcpStatus };
+        }),
+      setMcpTools: (id, tools) => set((s) => ({ mcpTools: { ...s.mcpTools, [id]: tools } })),
+      setMcpStatus: (id, st) => set((s) => ({ mcpStatus: { ...s.mcpStatus, [id]: st } })),
       sysoneSamples: [],
       sysoneGenProgress: null,
       setSysoneSamples: (sysoneSamples) => set({ sysoneSamples }),
@@ -572,6 +596,8 @@ export const useStudio = create<Studio>()(
         probe: s.probe,
         hyper: s.hyper,
         splitPct: s.splitPct,
+        mcpServers: s.mcpServers,
+        mcpTools: s.mcpTools,
         // big uploads would blow the ~5 MB localStorage quota
         text: s.text.length < 400_000 ? s.text : undefined,
       }),
@@ -585,6 +611,8 @@ export const useStudio = create<Studio>()(
           text: p.text ?? current.text,
           groups: p.groups ?? current.groups,
           groupOf: p.groupOf ?? current.groupOf,
+          mcpServers: p.mcpServers ?? current.mcpServers,
+          mcpTools: p.mcpTools ?? current.mcpTools,
         };
       },
     },

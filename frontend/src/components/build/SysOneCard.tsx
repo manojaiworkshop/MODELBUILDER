@@ -236,6 +236,7 @@ export function SysOneCard() {
                   <li key={sm.id} className="group flex items-start gap-2 px-3 py-2">
                     <div className="min-w-0 flex-1 text-xs leading-snug">
                       <div className="font-medium">{sm.state}</div>
+                      {sm.call && <div className="mt-0.5 break-all font-mono text-[11px] text-accent">{sm.call.tool}({JSON.stringify(sm.call.arguments)})</div>}
                       <ul className="mt-1 space-y-0.5 text-muted">
                         {sm.questions.map((q, i) => <li key={i}>{previewQt(q, sm.targets[i])}</li>)}
                       </ul>

@@ -40,7 +40,8 @@ impl EncodeConfig {
             max_seq_len,
             max_state_tokens: (max_seq_len / 2).max(8),
             max_question_tokens: 32.min(max_seq_len / 4).max(4),
-            max_option_tokens: 8.min(max_seq_len / 8).max(2),
+            // roomy enough for a qualified tool name (`server__tool`) as an option label
+            max_option_tokens: (max_seq_len / 8).clamp(2, 32),
         }
     }
 }

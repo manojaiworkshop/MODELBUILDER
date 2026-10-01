@@ -4,7 +4,7 @@ import { isRunning, useStudio } from "@/lib/store";
 import type { SysOneHyper } from "@/lib/types";
 import { Card, Field, NumberInput, SectionHeader } from "../ui/kit";
 
-type Def = { key: keyof SysOneHyper; label: string; help: string; min: number; max: number; step?: number };
+type Def = { key: Exclude<keyof SysOneHyper, "device">; label: string; help: string; min: number; max: number; step?: number };
 
 const ARCH: Def[] = [
   { key: "dModel", label: "d_model", help: "Width of every token's vector. Must be a multiple of heads.", min: 8, max: 2048, step: 8 },

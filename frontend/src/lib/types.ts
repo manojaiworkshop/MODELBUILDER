@@ -335,6 +335,8 @@ export interface SysOneSample {
   questions: SysOneQuestion[];
   targets: SysOneTarget[];
   source: string;
+  /** Tool-calling samples: the full call the questions were derived from. */
+  call?: { tool: string; arguments: unknown } | null;
 }
 
 export interface SysOneGenProgress {
@@ -370,6 +372,8 @@ export interface SysOneHyper {
   dFf: number;
   dropout: number;
   maxSeqLen: number;
+  /** Where training runs; the trained model is always served from the CPU. */
+  device: "cpu" | "gpu";
 }
 
 export interface SysOneStep {
@@ -419,4 +423,80 @@ export interface HfDatasetInfo {
   dataset: string;
   splits: HfSplitInfo[];
   columns: HfColumn[];
+}
+
+// ------------------------------------------- Tool calling with the trained model
+
+export interface ToolCandidate {
+  name: string;
+  relevance: number;
+  choice: number | null;
+}
+export interface ToolDecision {
+  path: string;
+  question: string;
+  answer: string;
+  p: number;
+  confidence: number;
+  used: boolean;
+}
+export interface ToolMissing {
+  path: string;
+  required: boolean;
+  reason: string;
+}
+export interface ToolCallResult {
+  tool: string;
+  toolConfidence: number;
+  candidates: ToolCandidate[];
+  specificity: string | null;
+  arguments: Record<string, unknown>;
+  decisions: ToolDecision[];
+  missing: ToolMissing[];
+  /** OpenAI shape: `[{function: {arguments: "<json string>", name}, id, type: "function"}]`. */
+  toolCalls: unknown[];
+}
+
+// ------------------------------------------- Tool-calling dataset (MCP servers)
+
+export type McpTransport = "stdio" | "sse" | "http";
+
+/** An MCP server the user connected. Kept in the browser (localStorage); the backend only
+ * receives it when asked to connect. */
+export interface McpServer {
+  id: string;
+  /** Also the prefix of qualified tool names: `<name>__<tool>`. */
+  name: string;
+  transport: McpTransport;
+  /** stdio: program to run (no shell) and its arguments. */
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd: string;
+  /** sse / http endpoint. */
+  url: string;
+  timeoutSecs: number | null;
+  connectTimeoutSecs: number | null;
+  /** Whether this server's tools are part of the tool-calling dataset. */
+  enabled: boolean;
+}
+
+export interface McpTool {
+  name: string;
+  title: string | null;
+  description: string | null;
+  /** JSON Schema of the arguments. */
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown> | null;
+  readOnly: boolean | null;
+}
+
+/** Last connection attempt for one server (not persisted). */
+export interface McpStatus {
+  busy: "refresh" | "test" | null;
+  ok: boolean | null;
+  message: string;
+  serverName?: string | null;
+  serverVersion?: string | null;
+  elapsedMs?: number;
 }

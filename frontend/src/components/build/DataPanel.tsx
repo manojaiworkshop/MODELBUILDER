@@ -10,6 +10,7 @@ import { cancelUpload, MAX_FILE_BYTES, uploadFiles } from "@/lib/upload";
 import { QaCard } from "./QaCard";
 import { SummaryCard } from "./SummaryCard";
 import { SysOneCard } from "./SysOneCard";
+import { SysOneToolsCard } from "./SysOneToolsCard";
 import { importTokenizer, resetTokenizer } from "@/lib/sync";
 import { Badge, Button, Card, Field, NumberInput, SectionHeader, Segmented, Toggle, cn } from "../ui/kit";
 
@@ -401,7 +402,10 @@ export function DataPanel(): ReactNode {
     <div className="space-y-4 p-4">
       <SourcesCard />
       {sysone ? (
-        <SysOneCard />
+        <>
+          <SysOneCard />
+          <SysOneToolsCard />
+        </>
       ) : (
         <>
           <QaCard />

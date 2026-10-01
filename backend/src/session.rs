@@ -102,6 +102,18 @@ pub struct SysOneSynthJob {
     pub concurrency: usize,
 }
 
+/// A request to generate tool-calling samples: for each of `tools` (one model task per tool, up
+/// to `concurrency` at once) the model writes requests with the right arguments, and code turns
+/// them into typed questions (see `sysone::toolgen`). `catalogue` supplies the distractor tools.
+pub struct SysOneToolGenJob {
+    pub llm: LlmConfig,
+    pub tools: Vec<sysone::toolgen::ToolDef>,
+    pub catalogue: Vec<sysone::toolgen::ToolDef>,
+    pub per_tool: usize,
+    pub distractors: usize,
+    pub concurrency: usize,
+}
+
 /// A request to import rows of a public Hugging Face dataset, converted into Choice-question
 /// System One samples (see `sysone::hfimport`).
 pub struct SysOneHfImportJob {
@@ -122,6 +134,10 @@ pub struct Shared {
     pub builds: Arc<Semaphore>,
     /// Concurrent Learn-tab chat requests (each is an outbound HTTP call to a user-configured server).
     pub learns: Arc<Semaphore>,
+    /// Concurrent MCP server connections (Tool-calling dataset).
+    pub mcp_conns: Arc<Semaphore>,
+    /// Whether MCP servers may be started as local commands (see sysone/mcp.rs).
+    pub mcp_stdio: bool,
     /// Concurrent dataset-generation model calls (Q&A and summaries share one budget) across all sessions.
     pub qa_calls: Arc<Semaphore>,
     /// Shared, connection-pooling client for talking to that server.
@@ -153,6 +169,8 @@ impl Shared {
             extractions: Arc::new(Semaphore::new(env_u64("MAX_EXTRACTIONS", 2) as usize)),
             builds: Arc::new(Semaphore::new(env_u64("MAX_BUILDS", 2) as usize)),
             learns: Arc::new(Semaphore::new(env_u64("MAX_LEARN_ASKS", 4) as usize)),
+            mcp_conns: Arc::new(Semaphore::new(env_u64("MAX_MCP_CONNECTIONS", 4) as usize)),
+            mcp_stdio: crate::sysone::mcp::stdio_allowed(&std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into())),
             qa_calls: Arc::new(Semaphore::new(env_u64("MAX_QA_CALLS", 16) as usize)),
             http: reqwest::Client::builder().build().expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
@@ -799,6 +817,78 @@ impl Session {
         });
     }
 
+    /// Generates tool-calling samples, one task per tool. Same `sysone:progress` /
+    /// `sysone:added` events as the other generators; `done` counts tools.
+    pub fn spawn_sysone_toolgen(self: &Arc<Self>, job: SysOneToolGenJob, cancel: Arc<AtomicBool>) {
+        let s = self.clone();
+        tokio::spawn(async move {
+            let total = job.tools.len();
+            let emit = |state: &'static str, done: usize, samples: usize, failed: usize, message: String| {
+                let _ = s.socket.emit("sysone:progress", &SysOneGenProgress { state, done, total, samples, failed, message });
+            };
+            emit("running", 0, 0, 0, String::new());
+
+            let local = Arc::new(Semaphore::new(job.concurrency.max(1)));
+            let catalogue = Arc::new(job.catalogue);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Result<Vec<Sample>, String>)>();
+            for tool in job.tools {
+                let (local, global, client, llm, cancel, tx, catalogue) = (local.clone(), s.shared.qa_calls.clone(), s.shared.http.clone(), job.llm.clone(), cancel.clone(), tx.clone(), catalogue.clone());
+                let (per_tool, distractors) = (job.per_tool, job.distractors);
+                tokio::spawn(async move {
+                    let Ok(_l) = local.acquire_owned().await else { return };
+                    let Ok(_g) = global.acquire_owned().await else { return };
+                    let res = if cancel.load(Ordering::Relaxed) {
+                        Err("cancelled".into())
+                    } else {
+                        sysone::toolgen::generate_for_tool(&client, &llm, &tool, &catalogue, per_tool, distractors, &cancel).await
+                    };
+                    let _ = tx.send((tool.name, res));
+                });
+            }
+            drop(tx);
+
+            let (mut done, mut made, mut failed) = (0usize, 0usize, 0usize);
+            let mut first_err: Option<String> = None;
+            let mut fatal = false;
+            while let Some((name, res)) = rx.recv().await {
+                match res {
+                    Ok(list) => {
+                        let mut added = Vec::new();
+                        {
+                            let mut d = s.data.lock().await;
+                            for mut sample in list {
+                                if d.sysone_samples.len() >= sysone::generate::MAX_SAMPLES {
+                                    break;
+                                }
+                                sample.id = d.new_sysone_id();
+                                d.sysone_samples.push(sample.clone());
+                                added.push(sample);
+                            }
+                        }
+                        made += added.len();
+                        let _ = s.socket.emit("sysone:added", &added);
+                    }
+                    Err(e) if e == "cancelled" => {}
+                    Err(e) => {
+                        failed += 1;
+                        if e.contains("API key") || e.contains("Settings") || e.contains("(404)") {
+                            fatal = true;
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        first_err.get_or_insert(format!("{name}: {e}"));
+                    }
+                }
+                done += 1;
+                emit("running", done, made, failed, first_err.clone().unwrap_or_default());
+            }
+            let stopped = cancel.load(Ordering::Relaxed) && !fatal;
+            s.emit_sysone_list().await;
+            *s.sysone_cancel.lock().unwrap() = None;
+            let state = if fatal { "error" } else if stopped { "stopped" } else { "done" };
+            emit(state, done, made, failed, first_err.unwrap_or_default());
+        });
+    }
+
     /// Fetches a slice of a public Hugging Face dataset and converts it into Choice-question
     /// samples (see `sysone::hfimport`). Same `sysone:progress` / `sysone:added` events as the
     /// other two generation modes, just with coarser (fetch / convert) progress steps since this
@@ -888,12 +978,8 @@ impl Session {
         let s = self.clone();
         tokio::spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<sysone::train::Event>();
-            let device = Default::default();
             let (s2, cancel2) = (s.clone(), cancel.clone());
-            let handle = tokio::task::spawn_blocking(move || {
-                type TB = burn::backend::Autodiff<IB>;
-                sysone::train::run::<TB>(samples, hyper, device, cancel2, tx)
-            });
+            let handle = tokio::task::spawn_blocking(move || sysone::train::run_selected(samples, hyper, cancel2, tx));
 
             while let Some(ev) = rx.recv().await {
                 let _ = match ev {

@@ -23,10 +23,13 @@ encoding_rs = "0.8"          # UTF-16 / windows-1252 / … -> UTF-8
 flate2 = "1"                 # .gz
 rayon = "1"                  # parallel tokenization of huge corpora
 futures-util = "0.3"
+# MCP client (Tool-calling dataset: list the tools of stdio / SSE / streamable-HTTP servers). Pinned to 0.10 like netmon_cardinality: later versions dropped legacy SSE-only servers.
+rmcp = { version = "0.10", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }   # Learn tab -> user-configured chat endpoint
 
 # CPU-only training engine: tensors + autograd, pure Rust.
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "vulkan", "fusion"] }
+burn-ndarray = { version = "0.21.0", default-features = false, features = ["std", "multi-threads"] }   # CPU backend: matmuls across all cores (feature-unified into burn's ndarray)
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 arrow-json = "60.0.0"
 arrow-schema = "60.0.0"

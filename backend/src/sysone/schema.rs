@@ -60,6 +60,15 @@ impl Target {
     }
 }
 
+/// The tool call a tool-calling sample was derived from: the full ground truth, including
+/// arguments (free text, nested values) that the typed questions can't express.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Qualified name, `<server>__<tool>`.
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sample {
@@ -73,6 +82,9 @@ pub struct Sample {
     /// Which generator produced this (for per-source metrics / provenance).
     #[serde(default)]
     pub source: String,
+    /// Set for tool-calling samples (see `toolgen.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<ToolCall>,
 }
 
 impl Sample {
@@ -139,6 +151,7 @@ mod tests {
             ],
             targets: vec![Target::Noul { p: 1.0 }, Target::choice_hard(2, 0)],
             source: "test".into(),
+            call: None,
         }
     }
 

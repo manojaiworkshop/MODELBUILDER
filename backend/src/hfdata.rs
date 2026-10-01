@@ -420,6 +420,7 @@ mod tests {
             questions: vec![Question::Noul { text: "urgent?".into() }],
             targets: vec![Target::Noul { p: 0.9 }],
             source: "test".into(),
+            call: None,
         };
         let exported = export_sysone(&[good.clone()]);
         let (items, skipped) = import_sysone(&exported).unwrap();

@@ -183,6 +183,7 @@ pub fn rows_to_samples(rows: &[Value], text_col: &str, label_col: &str, class_na
                 questions: vec![Question::Choice { text: question_text.to_string(), options: options.clone() }],
                 targets: vec![Target::Choice { probs }],
                 source: source.to_string(),
+                call: None,
             })
         })
         .collect()

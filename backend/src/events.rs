@@ -216,6 +216,26 @@ pub struct SysOneSynthReq {
 fn d_per_sysone_batch() -> usize { 5 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneToolGenReq {
+    pub llm: LlmConfig,
+    /// The tools to write samples for.
+    pub tools: Vec<crate::sysone::toolgen::ToolDef>,
+    /// Every tool the dataset should tell apart (distractors come from here); empty = just `tools`.
+    #[serde(default)]
+    pub catalogue: Vec<crate::sysone::toolgen::ToolDef>,
+    #[serde(default = "d_per_tool")]
+    pub per_tool: usize,
+    #[serde(default = "d_distractors")]
+    pub distractors: usize,
+    #[serde(default = "d_tool_parallel")]
+    pub concurrency: usize,
+}
+fn d_per_tool() -> usize { 10 }
+fn d_distractors() -> usize { 3 }
+fn d_tool_parallel() -> usize { 4 }
+
+#[derive(Debug, Deserialize)]
 pub struct SysOneHfInfoReq {
     pub dataset: String,
 }
@@ -247,6 +267,15 @@ pub struct SysOneTrainStartReq {
 pub struct SysOneInferReq {
     pub state: String,
     pub questions: Vec<crate::sysone::schema::Question>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SysOneToolCallReq {
+    /// The request, in the user's words.
+    pub state: String,
+    /// The tools to choose among (name, description, input schema).
+    pub tools: Vec<crate::sysone::toolgen::ToolDef>,
 }
 
 #[derive(Debug, Deserialize)]
