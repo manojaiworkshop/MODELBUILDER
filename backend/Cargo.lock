@@ -4037,6 +4037,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "socketioxide",
  "tempfile",
  "tokenizers 0.23.2",

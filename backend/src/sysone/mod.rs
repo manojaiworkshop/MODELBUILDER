@@ -10,8 +10,12 @@
 
 pub mod api;
 pub mod encode;
+pub mod engine;
 pub mod generate;
 pub mod hfimport;
+pub mod laya;
+pub mod layahub;
+pub mod layatrain;
 pub mod loss;
 pub mod mcp;
 pub mod mask;

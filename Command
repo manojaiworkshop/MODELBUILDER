@@ -48,3 +48,5 @@ Limits of this comparison
 I only had access to the model card, config and file listing, not the code or weights. Their numbers (for example 0.766 accuracy and the 0.713 benchmark scores) come from the card's own benchmarks and I haven't verified them.
 
 If you want, I can look at what it would take to load a small pretrained encoder into your Rust backend. That is the change most likely to improve your results.
+
+sk-9790506354d0d8b43199668f9eaa93580ea35ef5b276e8f0

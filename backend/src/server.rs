@@ -791,6 +791,9 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
             if s.sysone_train_cancel.lock().unwrap().is_some() {
                 return ack.send(&fail("A System One training run is already in progress; stop it first.")).ok().unwrap_or(());
             }
+            if req.hyper.base == "laya" && !sysone::laya::is_downloaded(&sysone::laya::cache_dir()) {
+                return ack.send(&fail("Import Laya first (Training tab → Start from → Laya).")).ok().unwrap_or(());
+            }
             let samples = s.data.lock().await.sysone_samples.clone();
             if samples.is_empty() {
                 return ack.send(&fail("There are no System One samples yet. Generate some in the Data tab first.")).ok().unwrap_or(());
@@ -824,8 +827,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("No trained System One model yet — train one first.")).ok().unwrap_or(());
             };
             let result = tokio::task::spawn_blocking(move || {
-                let device = Default::default();
-                sysone::api::decide::<IB>(&trained.model, &trained.tok, &trained.enc, &device, &req.state, &req.questions)
+                trained.decide(&req.state, &req.questions)
             })
             .await;
             match result {
@@ -853,8 +855,7 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("No trained System One model yet — train one first.")).ok().unwrap_or(());
             };
             let result = tokio::task::spawn_blocking(move || {
-                let device = Default::default();
-                sysone::toolcall::call_tool::<IB>(&trained.model, &trained.tok, &trained.enc, &device, &req.state, &req.tools)
+                trained.call_tool(&req.state, &req.tools)
             })
             .await;
             match result {
@@ -862,6 +863,60 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 Ok(Err(e)) => ack.send(&fail(e)).ok(),
                 Err(e) => ack.send(&fail(format!("inference crashed: {e}"))).ok(),
             };
+        });
+    }
+
+
+    // ------------------------------------------------------------------ laya
+    {
+        socket.on("sysone:laya:status", async move |ack: AckSender| {
+            ack.send(&json!({ "ok": true, "status": sysone::layahub::LayaStatus::current(&sysone::laya::cache_dir()) })).ok();
+        });
+    }
+    {
+        let s = s.clone();
+        let shared = shared.clone();
+        socket.on("sysone:laya:download", async move |ack: AckSender| {
+            let dir = sysone::laya::cache_dir();
+            if sysone::laya::is_downloaded(&dir) {
+                return ack.send(&json!({ "ok": true })).ok().unwrap_or(());
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut slot = shared.laya_download.lock().unwrap();
+                if slot.is_some() {
+                    return ack.send(&fail("Laya is already downloading.")).ok().unwrap_or(());
+                }
+                *slot = Some(cancel.clone());
+            }
+            ack.send(&json!({ "ok": true })).ok();
+            let (s2, shared2) = (s.clone(), shared.clone());
+            tokio::spawn(async move {
+                let emit = |st: sysone::layahub::LayaStatus| {
+                    let _ = s2.socket.emit("sysone:laya:status", &st);
+                };
+                emit(sysone::layahub::LayaStatus { state: "downloading", done: 0, total: sysone::laya::WEIGHTS_BYTES_HINT, message: String::new() });
+                let s3 = s2.clone();
+                let result = sysone::layahub::download(&dir, cancel.clone(), move |done, total| {
+                    let _ = s3.socket.emit("sysone:laya:status", &sysone::layahub::LayaStatus { state: "downloading", done, total, message: String::new() });
+                })
+                .await;
+                *shared2.laya_download.lock().unwrap() = None;
+                match result {
+                    Ok(()) => emit(sysone::layahub::LayaStatus::current(&dir)),
+                    Err(e) if e == "cancelled" => emit(sysone::layahub::LayaStatus::current(&dir)),
+                    Err(e) => emit(sysone::layahub::LayaStatus { state: "error", done: 0, total: 0, message: e }),
+                }
+            });
+        });
+    }
+    {
+        let shared = shared.clone();
+        socket.on("sysone:laya:cancel", async move |ack: AckSender| {
+            if let Some(c) = shared.laya_download.lock().unwrap().as_ref() {
+                c.store(true, Ordering::Relaxed);
+            }
+            ack.send(&json!({ "ok": true })).ok();
         });
     }
 

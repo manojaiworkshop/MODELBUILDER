@@ -77,7 +77,7 @@ pub struct ToolCallOutput {
 
 /// Answers `questions` for `state`, splitting them over as many forward passes as the context
 /// needs (questions can't see each other, so splitting doesn't change any answer).
-fn answer_all<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &EncodeConfig, device: &B::Device, state: &str, questions: &[Question]) -> Result<Vec<Answer>, String> {
+pub(crate) fn answer_all<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &EncodeConfig, device: &B::Device, state: &str, questions: &[Question]) -> Result<Vec<Answer>, String> {
     let budget = enc.max_seq_len.saturating_sub(1 + 64.min(enc.max_seq_len / 3));
     let mut chunks: Vec<Vec<Question>> = vec![Vec::new()];
     let mut used = 0usize;
@@ -197,6 +197,11 @@ fn call_id(request: &str, tool: &str) -> String {
 
 /// The whole pipeline for one request over `tools`.
 pub fn call_tool<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &EncodeConfig, device: &B::Device, request: &str, tools: &[ToolDef]) -> Result<ToolCallOutput, String> {
+    call_tool_with(&|state, qs| answer_all(model, tok, enc, device, state, qs), request, tools)
+}
+
+/// Same pipeline over any model that can answer a batch of typed questions about a state.
+pub fn call_tool_with(answer: &dyn Fn(&str, &[Question]) -> Result<Vec<Answer>, String>, request: &str, tools: &[ToolDef]) -> Result<ToolCallOutput, String> {
     if tools.is_empty() {
         return Err("There are no tools to choose from.".into());
     }
@@ -207,7 +212,7 @@ pub fn call_tool<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &Enco
         (0, 1.0)
     } else {
         let qs: Vec<Question> = tools.iter().map(|t| Question::Noul { text: format!("{} — is this the right tool?", t.name) }).collect();
-        for (c, a) in candidates.iter_mut().zip(answer_all(model, tok, enc, device, request, &qs)?) {
+        for (c, a) in candidates.iter_mut().zip(answer(request, &qs)?) {
             c.relevance = noul(&a).0;
         }
         // the most relevant few, kept in catalogue order, go into one choice
@@ -216,7 +221,7 @@ pub fn call_tool<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &Enco
         let mut top: Vec<usize> = order.into_iter().take(CHOICE_OPTIONS.min(tools.len())).collect();
         top.sort_unstable();
         let q = Question::Choice { text: "Which tool fits this request?".into(), options: top.iter().map(|&i| tools[i].name.clone()).collect() };
-        match answer_all(model, tok, enc, device, request, &[q])?.remove(0) {
+        match answer(request, &[q])?.remove(0) {
             Answer::Choice { probs, best, .. } => {
                 for (&i, &p) in top.iter().zip(&probs) {
                     candidates[i].choice = Some(p);
@@ -232,7 +237,7 @@ pub fn call_tool<B: Backend>(model: &SysOneModel<B>, tok: &Tokenizer, enc: &Enco
     let specs = arg_specs(&tool.input_schema);
     let mut qs: Vec<Question> = specs.iter().map(|s| s.question()).collect();
     qs.push(Question::Score { text: "How completely does the request specify the call?".into(), levels: SPECIFICITY.iter().map(|s| s.to_string()).collect() });
-    let mut answers = answer_all(model, tok, enc, device, request, &qs)?;
+    let mut answers = answer(request, &qs)?;
     let specificity = match answers.pop() {
         Some(Answer::Score { probs, .. }) => Some(SPECIFICITY[argmax(&probs).min(SPECIFICITY.len() - 1)].to_string()),
         _ => None,

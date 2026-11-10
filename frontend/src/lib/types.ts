@@ -374,6 +374,22 @@ export interface SysOneHyper {
   maxSeqLen: number;
   /** Where training runs; the trained model is always served from the CPU. */
   device: "cpu" | "gpu";
+  /** "scratch" = random weights; "laya" = fine-tune the pretrained Laya checkpoint (GPU only). */
+  base: "scratch" | "laya";
+  /** Laya: encoder layers (from the top, of 28) that are fine-tuned; the rest stay frozen. */
+  layaLayers: number;
+  /** Laya: tokens per question sequence. */
+  layaMaxLen: number;
+  /** Laya: questions drawn from each sample per epoch. */
+  layaQuestions: number;
+}
+
+/** State of the local copy of Laya (pushed by the server). */
+export interface LayaStatus {
+  state: "missing" | "downloading" | "ready" | "error";
+  done: number;
+  total: number;
+  message: string;
 }
 
 export interface SysOneStep {

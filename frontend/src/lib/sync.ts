@@ -7,7 +7,7 @@ import { qualifiedToolName } from "./mcp";
 import type {
   McpServer, McpTool, ToolCallResult,
   BuildProgress, DataStyle, DataInfo, DocInfo, EvalPoint, HfDatasetInfo, InspectPayload, LearnAnswer, LlmConfig, QaPageList, QaPair, QaProgress, SamplePayload,
-  StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneMix, SysOneQuestion, SysOneSample, SysOneStep, TokenizerInfo,
+  LayaStatus, StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneMix, SysOneQuestion, SysOneSample, SysOneStep, TokenizerInfo,
 } from "./types";
 
 /** Keeps the backend in step with the UI. Mount once. */
@@ -57,6 +57,7 @@ export function useBackendSync() {
     const onSysoneList = (p: SysOneSample[]) => st().setSysoneSamples(p);
     const onSysoneAdded = (p: SysOneSample[]) => st().addSysoneSamples(p);
     const onSysoneGenProgress = (p: SysOneGenProgress) => st().setSysoneGenProgress(p);
+    const onLayaStatus = (p: LayaStatus) => st().setLayaStatus(p);
     const onSysoneTrainStatus = (p: StatusPayload) => {
       st().setSysoneStatus(p);
       if (p.state === "done") st().setSysoneTrained(true);
@@ -96,6 +97,7 @@ export function useBackendSync() {
     s.on("sysone:added", onSysoneAdded);
     s.on("sysone:progress", onSysoneGenProgress);
     s.on("sysone:train:status", onSysoneTrainStatus);
+    s.on("sysone:laya:status", onLayaStatus);
     s.on("sysone:train:step", onSysoneTrainStep);
     s.on("sysone:train:eval", onSysoneTrainEval);
     s.on("data:progress", onProgress);
@@ -123,6 +125,7 @@ export function useBackendSync() {
       s.off("sysone:added", onSysoneAdded);
       s.off("sysone:progress", onSysoneGenProgress);
       s.off("sysone:train:status", onSysoneTrainStatus);
+      s.off("sysone:laya:status", onLayaStatus);
       s.off("sysone:train:step", onSysoneTrainStep);
       s.off("sysone:train:eval", onSysoneTrainEval);
       s.off("data:progress", onProgress);
@@ -376,6 +379,27 @@ export async function startSysOneTrain() {
     st.setSysoneStatus({ state: "error", message: (e as Error).message, step: 0, total: 0 });
   }
 }
+
+/** Asks the server whether Laya is already on disk (call when the Training tab opens). */
+export async function checkLaya() {
+  try {
+    const r = await call<{ ok: boolean; status: LayaStatus }>("sysone:laya:status");
+    if (r.ok) useStudio.getState().setLayaStatus(r.status);
+  } catch {}
+}
+
+export async function downloadLaya() {
+  const st = useStudio.getState();
+  st.setLayaStatus({ state: "downloading", done: 0, total: 0, message: "" });
+  try {
+    const r = await call<{ ok: boolean; error?: string }>("sysone:laya:download");
+    if (!r.ok) st.setLayaStatus({ state: "error", done: 0, total: 0, message: r.error ?? "Could not start the download" });
+  } catch (e) {
+    st.setLayaStatus({ state: "error", done: 0, total: 0, message: (e as Error).message });
+  }
+}
+
+export const cancelLayaDownload = () => call("sysone:laya:cancel").catch(() => {});
 
 export const stopSysOneTrain = () => call("sysone:train:stop").catch(() => {});
 

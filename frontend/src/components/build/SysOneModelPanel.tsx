@@ -4,7 +4,7 @@ import { isRunning, useStudio } from "@/lib/store";
 import type { SysOneHyper } from "@/lib/types";
 import { Card, Field, NumberInput, SectionHeader } from "../ui/kit";
 
-type Def = { key: Exclude<keyof SysOneHyper, "device">; label: string; help: string; min: number; max: number; step?: number };
+type Def = { key: Exclude<keyof SysOneHyper, "device" | "base" | "layaLayers" | "layaMaxLen" | "layaQuestions">; label: string; help: string; min: number; max: number; step?: number };
 
 const ARCH: Def[] = [
   { key: "dModel", label: "d_model", help: "Width of every token's vector. Must be a multiple of heads.", min: 8, max: 2048, step: 8 },
@@ -25,6 +25,11 @@ export function SysOneModelPanel() {
 
   return (
     <div className="space-y-4 overflow-y-auto p-4">
+      {hyper.base === "laya" && (
+        <p className="rounded-lg border border-accent/40 bg-accent/5 px-3 py-2.5 text-xs">
+          <strong>Starting from Laya.</strong> The architecture below is ignored: training fine-tunes the pretrained Laya encoder (ModernBERT-large, 28 layers, 1024 wide) and its decision head. Laya reads one question per sequence, with each option scored at its own [MASK] token. Choose how much to fine-tune in the Training tab.
+        </p>
+      )}
       <Card>
         <SectionHeader
           title="System One — JEV model"

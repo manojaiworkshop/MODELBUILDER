@@ -7,7 +7,7 @@ import { DEFAULT_SAMPLE } from "./samples";
 import { seedGroups, uniqueLabel, type BlockGroup, type GroupMembership } from "./transformerGroups";
 import type {
   Block, BlockType, BuildProgress, DataInfo, DocInfo, EvalPoint, Hyper, InspectPayload, LearnChatMsg, LlmConfig, McpServer, McpStatus, McpTool, QaPair, QaProgress, SamplePayload,
-  StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, SysOneHyper, SysOneSample, SysOneStep,
+  StatusPayload, StepPoint, SummaryPair, SummaryProgress, SysOneAnswer, SysOneEval, SysOneGenProgress, LayaStatus, SysOneHyper, SysOneSample, SysOneStep,
   TokenizerInfo, TrainMode, TrainSource, UploadItem,
 } from "./types";
 
@@ -22,10 +22,16 @@ export const DEFAULT_HYPER: Hyper = {
 export const DEFAULT_TOKENIZER: TokenizerInfo = { kind: "default", name: "", model: "", fullVocab: 0 };
 
 /** Mirrors the Rust `TrainHyper::default()` in `backend/src/sysone/train.rs`. */
+const DEFAULT_SYSONE_HYPER_LR = 5e-4;
 export const DEFAULT_SYSONE_HYPER: SysOneHyper = {
   epochs: 30, batchSize: 16, lr: 5e-4, warmupSteps: 100, confWeight: 0.5, gradClip: 1.0,
   seed: 42, merges: 200, dModel: 128, nHeads: 4, nKvHeads: 2, nLayers: 4, dFf: 512, dropout: 0.1, maxSeqLen: 256, device: "cpu",
+  base: "scratch", layaLayers: 4, layaMaxLen: 384, layaQuestions: 4,
 };
+
+/** Settings that suit fine-tuning Laya (tiny learning rate, few epochs, GPU) rather than training from scratch. */
+export const LAYA_PRESET: Partial<SysOneHyper> = { base: "laya", device: "gpu", lr: 2e-5, epochs: 3, batchSize: 16, warmupSteps: 50 };
+export const SCRATCH_PRESET: Partial<SysOneHyper> = { base: "scratch", lr: DEFAULT_SYSONE_HYPER_LR, epochs: 30, batchSize: 16, warmupSteps: 100 };
 const emptySysoneStatus = (): StatusPayload => ({ state: "idle", message: "", step: 0, total: 0 });
 
 export type Conn = "connecting" | "connected" | "disconnected";
@@ -158,6 +164,8 @@ export interface Studio {
   setSysoneGenProgress: (p: SysOneGenProgress | null) => void;
   sysoneHyper: SysOneHyper;
   setSysoneHyper: (p: Partial<SysOneHyper>) => void;
+  layaStatus: LayaStatus;
+  setLayaStatus: (s: LayaStatus) => void;
   sysoneStatus: StatusPayload;
   sysoneSteps: SysOneStep[];
   sysoneEvals: SysOneEval[];
@@ -495,6 +503,8 @@ export const useStudio = create<Studio>()(
       setSysoneGenProgress: (sysoneGenProgress) => set({ sysoneGenProgress }),
       sysoneHyper: DEFAULT_SYSONE_HYPER,
       setSysoneHyper: (p) => set((s) => ({ sysoneHyper: { ...s.sysoneHyper, ...p } })),
+      layaStatus: { state: "missing", done: 0, total: 0, message: "" },
+      setLayaStatus: (layaStatus) => set({ layaStatus }),
       sysoneStatus: emptySysoneStatus(),
       sysoneSteps: [],
       sysoneEvals: [],

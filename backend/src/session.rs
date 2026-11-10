@@ -142,6 +142,8 @@ pub struct Shared {
     pub qa_calls: Arc<Semaphore>,
     /// Shared, connection-pooling client for talking to that server.
     pub http: reqwest::Client,
+    /// Cancel flag of the Laya download in progress (one at a time, process-wide: it fills a shared cache).
+    pub laya_download: Mutex<Option<Arc<AtomicBool>>>,
     pub sessions: Mutex<HashMap<String, Arc<Session>>>,
     pub data_dir: PathBuf,
     /// Largest single upload.
@@ -173,6 +175,7 @@ impl Shared {
             mcp_stdio: crate::sysone::mcp::stdio_allowed(&std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into())),
             qa_calls: Arc::new(Semaphore::new(env_u64("MAX_QA_CALLS", 16) as usize)),
             http: reqwest::Client::builder().build().expect("build http client"),
+            laya_download: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
             max_file_bytes: env_u64("MAX_UPLOAD_BYTES", 1 << 30),
@@ -300,7 +303,7 @@ pub struct Session {
     /// System One training — a separate pipeline from the causal model's, so it gets its own
     /// cancel flag and trained-weights slot rather than sharing `train_cancel` / `trained`.
     pub sysone_train_cancel: Mutex<Option<Arc<AtomicBool>>>,
-    pub sysone_trained: Mutex<Option<Arc<TrainedSysOne<IB>>>>,
+    pub sysone_trained: Mutex<Option<Arc<sysone::engine::Engine>>>,
     /// Bumped on every change that needs a new dataset; a rebuild only finishes if it is still current.
     pub gen: AtomicU64,
     build_cancel: Mutex<Arc<AtomicBool>>,
@@ -979,7 +982,7 @@ impl Session {
         tokio::spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<sysone::train::Event>();
             let (s2, cancel2) = (s.clone(), cancel.clone());
-            let handle = tokio::task::spawn_blocking(move || sysone::train::run_selected(samples, hyper, cancel2, tx));
+            let handle = tokio::task::spawn_blocking(move || sysone::engine::run_training(samples, hyper, cancel2, tx));
 
             while let Some(ev) = rx.recv().await {
                 let _ = match ev {

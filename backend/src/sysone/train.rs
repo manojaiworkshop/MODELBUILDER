@@ -74,7 +74,25 @@ pub struct TrainHyper {
     /// "cpu" (all cores) or "gpu" (Vulkan); the trained weights always end up on the CPU for serving.
     #[serde(default)]
     pub device: String,
+    /// "scratch" (random weights, the architecture above) or "laya" (start from the pretrained
+    /// Laya checkpoint; the architecture fields are then ignored and training runs on the GPU).
+    #[serde(default)]
+    pub base: String,
+    /// Laya: how many of its 28 encoder layers (counted from the top) are fine-tuned; the rest
+    /// stay frozen. 0 trains only the decision head.
+    #[serde(default = "default_laya_layers")]
+    pub laya_layers: usize,
+    /// Laya: tokens per question sequence (options + state; the state is cut to fit).
+    #[serde(default = "default_laya_len")]
+    pub laya_max_len: usize,
+    /// Laya: questions drawn from each sample per epoch (each is its own sequence).
+    #[serde(default = "default_laya_questions")]
+    pub laya_questions: usize,
 }
+
+fn default_laya_layers() -> usize { 4 }
+fn default_laya_len() -> usize { 384 }
+fn default_laya_questions() -> usize { 4 }
 
 impl Default for TrainHyper {
     fn default() -> Self {
@@ -95,6 +113,10 @@ impl Default for TrainHyper {
             dropout: 0.1,
             max_seq_len: 256,
             device: "cpu".into(),
+            base: "scratch".into(),
+            laya_layers: default_laya_layers(),
+            laya_max_len: default_laya_len(),
+            laya_questions: default_laya_questions(),
         }
     }
 }
@@ -105,12 +127,19 @@ impl TrainHyper {
         chk(self.epochs >= 1 && self.epochs <= 200, "epochs must be 1..200")?;
         chk(self.batch_size >= 1 && self.batch_size <= 256, "batch size must be 1..256")?;
         chk(self.lr > 0.0 && self.lr < 1.0, "learning rate must be in (0, 1)")?;
+        if self.base == "laya" {
+            return chk(self.laya_layers <= 28 && (64..=2048).contains(&self.laya_max_len) && (1..=64).contains(&self.laya_questions), "Laya settings out of range");
+        }
         chk(self.d_model >= 8 && self.d_model % self.n_heads == 0, "d_model must be a positive multiple of heads")?;
         chk(self.n_heads >= 1 && self.n_heads % self.n_kv_heads.max(1) == 0, "heads must be a multiple of kv heads")?;
         chk(self.n_layers >= 1 && self.n_layers <= 64, "layers must be 1..64")?;
         chk(self.d_ff >= 8, "feed-forward width must be >= 8")?;
         chk(self.max_seq_len >= 16 && self.max_seq_len <= 4096, "max sequence length must be 16..4096")?;
         chk(matches!(self.device.as_str(), "" | "cpu" | "gpu"), "device must be \"cpu\" or \"gpu\"")?;
+        chk(matches!(self.base.as_str(), "" | "scratch" | "laya"), "base must be \"scratch\" or \"laya\"")?;
+        chk(self.laya_layers <= 28, "Laya layers to train must be 0..28")?;
+        chk((64..=2048).contains(&self.laya_max_len), "Laya tokens per question must be 64..2048")?;
+        chk((1..=64).contains(&self.laya_questions), "Laya questions per sample must be 1..64")?;
         Ok(())
     }
 }
@@ -283,7 +312,7 @@ pub fn evaluate<B: Backend>(model: &SysOneModel<B>, set: &Dataset, batch_size: u
 /// "Which epoch is best": mean accuracy minus the ECE of the stated
 /// probabilities. Calibration is the point of a decision model, so an epoch
 /// that gains a little accuracy while much worse calibrated must not win.
-fn quality(r: &Report) -> f32 {
+pub(crate) fn quality(r: &Report) -> f32 {
     let xs: Vec<f32> = [r.noul_acc, r.choice_acc, r.score_acc].into_iter().filter(|x| x.is_finite()).collect();
     let acc = if xs.is_empty() { 0.0 } else { xs.iter().sum::<f32>() / xs.len() as f32 };
     acc - r.prob_ece
