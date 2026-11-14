@@ -70,7 +70,7 @@ export function QaCard() {
 
   const available = useMemo(() => new Set(list?.pages.map((p) => p.n) ?? []), [list]);
   const running = progress?.state === "running";
-  const llmReady = !!(llm.baseUrl.trim() && llm.apiKey.trim() && llm.model.trim());
+  const llmReady = !!(llm.baseUrl.trim() && llm.model.trim());
   const label = list?.synthetic ? "section" : "page";
   const total = qa.length;
   const expected = picked.size * perPage;
@@ -165,7 +165,7 @@ export function QaCard() {
             {!llmReady && (
               <div className="flex items-center gap-2 rounded-lg border border-warn/40 bg-warn/5 px-3 py-2 text-xs text-warn">
                 <AlertTriangle size={14} className="shrink-0" />
-                <span className="flex-1">Connect a model server first (URL, API key, model).</span>
+                <span className="flex-1">Connect a model server first (URL and model name).</span>
                 <Button size="sm" onClick={() => setSettingsOpen(true)}><Settings2 size={13} /> Settings</Button>
               </div>
             )}

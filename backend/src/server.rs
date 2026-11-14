@@ -453,8 +453,8 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
             }
             let l = &req.llm;
-            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
-                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            if l.base_url.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL and model; the API key is optional) in Settings first.")).ok().unwrap_or(());
             }
             let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
             let Some(doc) = doc else {
@@ -524,8 +524,8 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
             }
             let l = &req.llm;
-            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
-                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            if l.base_url.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL and model; the API key is optional) in Settings first.")).ok().unwrap_or(());
             }
             let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
             let Some(doc) = doc else {
@@ -594,8 +594,8 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
             }
             let l = &req.llm;
-            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
-                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            if l.base_url.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL and model; the API key is optional) in Settings first.")).ok().unwrap_or(());
             }
             let doc = s.data.lock().await.docs.iter().find(|d| d.id == req.id && d.state == DocState::Ready).cloned();
             let Some(doc) = doc else {
@@ -636,8 +636,8 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("Parallel requests must be 1..16.")).ok().unwrap_or(());
             }
             let l = &req.llm;
-            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
-                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            if l.base_url.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL and model; the API key is optional) in Settings first.")).ok().unwrap_or(());
             }
             let cancel = Arc::new(AtomicBool::new(false));
             {
@@ -677,8 +677,8 @@ pub fn on_connect(socket: SocketRef, shared: Arc<Shared>) {
                 return ack.send(&fail("Parallel tools must be 1..8.")).ok().unwrap_or(());
             }
             let l = &req.llm;
-            if l.base_url.trim().is_empty() || l.api_key.trim().is_empty() || l.model.trim().is_empty() {
-                return ack.send(&fail("Set the model server (URL, API key and model) in Settings first.")).ok().unwrap_or(());
+            if l.base_url.trim().is_empty() || l.model.trim().is_empty() {
+                return ack.send(&fail("Set the model server (URL and model; the API key is optional) in Settings first.")).ok().unwrap_or(());
             }
             let cancel = Arc::new(AtomicBool::new(false));
             {

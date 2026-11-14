@@ -369,9 +369,9 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one failure then one success");
 
-        // a rejected key is fatal: no retry
-        let bad = LlmConfig { api_key: "".into(), ..llm };
-        assert!(generate_page(&reqwest::Client::new(), &bad, "d", 1, "text", 1, Style::Simple).await.unwrap_err().contains("API key"));
+        // a missing model name is fatal: no retry
+        let bad = LlmConfig { model: "".into(), ..llm };
+        assert!(generate_page(&reqwest::Client::new(), &bad, "d", 1, "text", 1, Style::Simple).await.unwrap_err().contains("model name"));
     }
 
     #[test]

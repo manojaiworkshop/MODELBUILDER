@@ -51,6 +51,8 @@ export function LlmSettingsModal({ open, onClose }: { open: boolean; onClose: ()
   const run = async () => {
     setTest({ state: "testing" });
     const res = await testLlmConnection(draft);
+    // Self-hosted servers list their real model id: adopt it when the current name isn't served.
+    if (res.ok && res.models?.length && !res.models.includes(draft.model)) setDraft((d) => ({ ...d, model: res.models![0] }));
     setTest(res.ok ? { state: "ok", message: res.models?.length ? `Reachable — ${res.models.length} model${res.models.length === 1 ? "" : "s"} listed.` : "Reachable." } : { state: "err", message: res.error });
   };
 
@@ -79,7 +81,7 @@ export function LlmSettingsModal({ open, onClose }: { open: boolean; onClose: ()
             className="h-9 w-full rounded-lg border border-border bg-surface px-3 font-mono text-sm outline-none focus:border-accent"
           />
         </Field>
-        <Field label="API key" help="Sent as an Authorization: Bearer header, only to the base URL above.">
+        <Field label="API key (optional)" help="Sent as an Authorization: Bearer header, only to the base URL above. Leave empty for servers that need none (vLLM, Ollama, llama.cpp).">
           <div className="relative">
             <input
               value={draft.apiKey}

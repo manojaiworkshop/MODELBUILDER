@@ -174,16 +174,16 @@ pub async fn complete(client: &reqwest::Client, llm: &LlmConfig, messages: Vec<s
     if base.is_empty() {
         return Err(LlmErr::fatal("No model server configured yet — open Settings and set the API base URL."));
     }
-    if llm.api_key.trim().is_empty() {
-        return Err(LlmErr::fatal("No API key configured yet — open Settings and set one."));
-    }
     if llm.model.trim().is_empty() {
         return Err(LlmErr::fatal("No model name configured yet — open Settings and set one."));
     }
     let body = serde_json::json!({ "model": llm.model, "stream": false, "messages": messages });
-    let resp = client
-        .post(format!("{base}/chat/completions"))
-        .bearer_auth(&llm.api_key)
+    let mut rq = client.post(format!("{base}/chat/completions"));
+    // Self-hosted servers (vLLM, llama.cpp, Ollama) often need no key: only send a header when one is set.
+    if !llm.api_key.trim().is_empty() {
+        rq = rq.bearer_auth(llm.api_key.trim());
+    }
+    let resp = rq
         .json(&body)
         .timeout(timeout)
         .send()
@@ -231,9 +231,11 @@ pub async fn list_models(client: &reqwest::Client, cfg: &LlmConfig) -> Result<Ve
     if base.is_empty() {
         return Err("Set the API base URL first.".into());
     }
-    let resp = client
-        .get(format!("{base}/models"))
-        .bearer_auth(&cfg.api_key)
+    let mut rq = client.get(format!("{base}/models"));
+    if !cfg.api_key.trim().is_empty() {
+        rq = rq.bearer_auth(cfg.api_key.trim());
+    }
+    let resp = rq
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -473,8 +475,8 @@ mod tests {
         r.llm.base_url = "".into();
         assert!(ask(&reqwest::Client::new(), &r).await.unwrap_err().contains("base URL"));
         r.llm.base_url = "http://x".into();
-        r.llm.api_key = "".into();
-        assert!(ask(&reqwest::Client::new(), &r).await.unwrap_err().contains("API key"));
+        r.llm.model = "".into();
+        assert!(ask(&reqwest::Client::new(), &r).await.unwrap_err().contains("model name"));
     }
 
     #[tokio::test]

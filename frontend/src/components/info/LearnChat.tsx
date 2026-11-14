@@ -83,7 +83,7 @@ export function LearnChat() {
   const clear = useStudio((s) => s.clearLearnChat);
   const blocks = useStudio((s) => s.blocks);
   const learnBlockId = useStudio((s) => s.learnBlockId);
-  const llmConfigured = useStudio((s) => !!s.llm.baseUrl.trim() && !!s.llm.apiKey.trim());
+  const llmConfigured = useStudio((s) => !!s.llm.baseUrl.trim() && !!s.llm.model.trim());
   const [input, setInput] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);

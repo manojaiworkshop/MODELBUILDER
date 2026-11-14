@@ -1,5 +1,7 @@
 "use client";
-import { Layers3, Moon, Play, Square, Sun } from "lucide-react";
+import { Download, Layers3, Moon, Play, Square, Sun } from "lucide-react";
+import { useState } from "react";
+import { HfModelModal } from "./build/HfModelModal";
 import { PRESETS } from "@/lib/presets";
 import { isRunning, useStudio } from "@/lib/store";
 import { startSysOneTrain, startTraining, stopSysOneTrain, stopTraining } from "@/lib/sync";
@@ -35,6 +37,7 @@ export function TopBar() {
   const sysoneStatus = useStudio((s) => s.sysoneStatus);
   const nSysoneSamples = useStudio((s) => s.sysoneSamples.length);
   const sysone = modelKind === "sysone";
+  const [hfOpen, setHfOpen] = useState(false);
   const running = sysone ? isRunning(sysoneStatus) : isRunning(status);
 
   return (
@@ -74,6 +77,10 @@ export function TopBar() {
           </option>
         </select>
       </label>
+      <Button size="sm" disabled={running || sysone} onClick={() => setHfOpen(true)} title="Build the block stack from a Hugging Face model URL or an uploaded model folder (reads config.json)">
+        <Download size={13} /> <span className="hidden lg:inline">From Hugging Face</span>
+      </Button>
+      <HfModelModal open={hfOpen} onClose={() => setHfOpen(false)} />
 
       <div className="flex-1" />
       <ConnPill />
