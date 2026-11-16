@@ -9,6 +9,7 @@ use crate::spec::{analyze, ModelSpec};
 use crate::tokenizer::Tokenized;
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::Autodiff;
+use burn::tensor::backend::AutodiffBackend;
 use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::nn::loss::CrossEntropyLoss;
@@ -20,8 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
-
-type TB = Autodiff<IB>;
 
 pub enum Event {
     Status(StatusPayload),
@@ -72,14 +71,15 @@ pub struct Metrics {
 /// the loss never moves.
 struct RequireGrad;
 
-impl burn::module::ModuleMapper<TB> for RequireGrad {
-    fn map_float<const D: usize>(&mut self, param: burn::module::Param<Tensor<TB, D>>) -> burn::module::Param<Tensor<TB, D>> {
+impl<B: AutodiffBackend> burn::module::ModuleMapper<B> for RequireGrad {
+    fn map_float<const D: usize>(&mut self, param: burn::module::Param<Tensor<B, D>>) -> burn::module::Param<Tensor<B, D>> {
         param.set_require_grad(true)
     }
 }
 
 pub type TrainedSlot = Arc<Mutex<Option<Arc<Trained>>>>;
 
+#[derive(Clone)]
 pub struct Job {
     pub spec: ModelSpec,
     pub tok: Arc<Tokenized>,
@@ -120,12 +120,74 @@ fn r4(x: f32) -> f32 {
     if x.is_finite() { (x * 10000.0).round() / 10000.0 } else { 0.0 }
 }
 
-pub fn run(job: Job) {
+/// Copies a model's weights onto another backend (e.g. GPU -> CPU) by round-tripping them through
+/// an in-memory record into a freshly built network of the same architecture.
+fn move_model<B1: Backend, B2: Backend>(m: Model<B1>, spec: &ModelSpec, device: &B2::Device) -> Model<B2> {
+    use burn::module::Module;
+    use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
+    let (vocab, seq) = (m.vocab_size(), m.max_seq_len);
+    let rec = BinBytesRecorder::<FullPrecisionSettings>::default();
+    let bytes = rec.record(m.into_record(), ()).expect("serialising the model weights");
+    let record = rec.load::<<Model<B2> as Module<B2>>::Record>(bytes, device).expect("loading the model weights");
+    build::<B2>(spec, vocab, seq, device).expect("rebuilding a model that was already built once").load_record(record)
+}
+
+/// Trains on the device the user picked. "gpu" tries CUDA first (works on NVIDIA cards, including
+/// MIG slices that Vulkan can't see), then Vulkan on a real GPU adapter, and finally falls back to
+/// the CPU with a note rather than failing the run.
+pub fn run(mut job: Job) {
+    if job.hyper.device == "gpu" {
+        use burn::backend::{cuda::CudaDevice, wgpu::WgpuDevice, Cuda, Wgpu};
+        if try_gpu::<Cuda>(&job, CudaDevice::default(), " on the GPU (CUDA)") {
+            return;
+        }
+        // Not WgpuDevice::default(): with no usable GPU that quietly picks a software Vulkan
+        // driver (lavapipe), which is far slower than the CPU backend.
+        if try_gpu::<Wgpu>(&job, WgpuDevice::DiscreteGpu(0), " on the GPU (Vulkan)") {
+            return;
+        }
+        let _ = job.tx.send(Event::Status(StatusPayload {
+            state: "preparing",
+            message: "No usable GPU (CUDA and Vulkan both failed to start) — training on the CPU instead.".into(),
+            step: 0,
+            total: job.hyper.steps,
+        }));
+        job.hyper.device = "cpu".into();
+    }
+    run_on::<Autodiff<IB>>(job, NdArrayDevice::default(), "", |m| m, |m| m)
+}
+
+/// Runs the job on GPU backend `G`. Returns false (having trained nothing) when the device can't
+/// be opened, or if the run panics, so the caller can fall back.
+fn try_gpu<G: Backend>(job: &Job, device: G::Device, label: &'static str) -> bool {
+    let probe = device.clone();
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || Tensor::<G, 1>::from_floats([1.0, 2.0], &probe).sum().into_scalar().elem::<f32>() == 3.0));
+    if !matches!(opened, Ok(true)) {
+        return false;
+    }
+    let job = job.clone();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let spec = job.spec.clone();
+        let (gpu, cpu) = (device.clone(), NdArrayDevice::default());
+        run_on::<Autodiff<G>>(job, device, label, |m| move_model::<IB, G>(m, &spec, &gpu), |m| move_model::<G, IB>(m, &spec, &cpu))
+    }))
+    .is_ok()
+}
+
+/// The training loop on backend `B`. `to_device` moves continued-from weights (kept on the CPU)
+/// onto `B`; `to_cpu` brings weights back for inspection, sampling and the trained-model slot.
+fn run_on<B: AutodiffBackend>(
+    job: Job,
+    device: B::Device,
+    on: &'static str,
+    to_device: impl Fn(Model<IB>) -> Model<B::InnerBackend>,
+    to_cpu: impl Fn(Model<B::InnerBackend>) -> Model<IB>,
+) {
     let Job { spec, tok, hyper: h, probe, cancel, tx, trained, init, own_vocab, provenance } = job;
     let status = |state: &'static str, message: String, step: usize| {
         let _ = tx.send(Event::Status(StatusPayload { state, message, step, total: h.steps }));
     };
-    status("preparing", "Building the network…".into(), 0);
+    status("preparing", format!("Building the network{on}…"), 0);
 
     let vocab = tok.bpe.vocab_size();
     let analysis = analyze(&spec, vocab, h.seq_len);
@@ -141,14 +203,13 @@ pub fn run(job: Job) {
     let val_len = n / 10;
     let (train_ids, val_ids) = if val_len >= h.seq_len + 2 { (&tok.ids[..n - val_len], &tok.ids[n - val_len..]) } else { (&tok.ids[..], &tok.ids[..]) };
 
-    let device = NdArrayDevice::default();
-    <TB as Backend>::seed(&device, h.seed);
-    let mut model: Model<TB> = match init {
+    B::seed(&device, h.seed);
+    let mut model: Model<B> = match init {
         Some(m) => {
             use burn::module::Module;
-            Model::<TB>::from_inner(m).map(&mut RequireGrad)
+            Model::<B>::from_inner(to_device(m)).map(&mut RequireGrad)
         }
-        None => match build::<TB>(&spec, vocab, h.seq_len, &device) {
+        None => match build::<B>(&spec, vocab, h.seq_len, &device) {
             Ok(m) => m,
             Err(e) => return status("error", e, 0),
         },
@@ -156,8 +217,8 @@ pub fn run(job: Job) {
     let mut optim = AdamWConfig::new()
         .with_weight_decay(h.weight_decay)
         .with_grad_clipping((h.grad_clip > 0.0).then(|| GradientClippingConfig::Norm(h.grad_clip)))
-        .init::<TB, Model<TB>>();
-    let loss_fn = CrossEntropyLoss::<TB>::new(None, &device);
+        .init::<B, Model<B>>();
+    let loss_fn = CrossEntropyLoss::<B>::new(None, &device);
     let mut rng = StdRng::seed_from_u64(h.seed);
     let fingerprint = spec.fingerprint();
 
@@ -179,14 +240,14 @@ pub fn run(job: Job) {
         *trained.lock().unwrap() = Some(Arc::new(Trained { model: m.clone(), spec: spec.clone(), hyper: h.clone(), provenance: provenance.clone(), metrics: metrics.clone(), fingerprint, seq_len: h.seq_len, step, tok: tok.clone(), own_vocab }));
     };
 
-    let eval = |m: &Model<IB>, step: usize| {
+    // Validation runs on the training device; only snapshots and samples need the CPU copy.
+    let eval = |m: &Model<B::InnerBackend>, step: usize| {
         let mut rng = StdRng::seed_from_u64(1234);
-        let idev = NdArrayDevice::default();
-        let loss_fn = CrossEntropyLoss::<IB>::new(None, &idev);
+        let loss_fn = CrossEntropyLoss::<B::InnerBackend>::new(None, &device);
         let mut total = 0.0f32;
         let batches = 4;
         for _ in 0..batches {
-            let (x, y) = batch::<IB>(val_ids, h.batch_size.min(16), h.seq_len, &mut rng, &idev);
+            let (x, y) = batch::<B::InnerBackend>(val_ids, h.batch_size.min(16), h.seq_len, &mut rng, &device);
             let logits = m.forward(x);
             let [b, s, v] = logits.dims();
             total += loss_fn.forward(logits.reshape([b * s, v]), y.reshape([b * s])).into_scalar().elem::<f32>();
@@ -205,9 +266,9 @@ pub fn run(job: Job) {
         let _ = tx.send(Event::Sample(SamplePayload { step, prompt, text }));
     };
 
-    status("running", "Training".into(), 0);
+    status("running", format!("Training{on}"), 0);
     // step 0: show the untrained network so the first curve point has context
-    snapshot(&model.valid(), 0, &[], true);
+    snapshot(&to_cpu(model.valid()), 0, &[], true);
 
     let mut done_steps = 0;
     for step in 1..=h.steps {
@@ -216,7 +277,7 @@ pub fn run(job: Job) {
         }
         let t0 = Instant::now();
         let lr = lr_at(step - 1, h.steps, h.lr, h.warmup_steps);
-        let (x, y) = batch::<TB>(train_ids, h.batch_size, h.seq_len, &mut rng, &device);
+        let (x, y) = batch::<B>(train_ids, h.batch_size, h.seq_len, &mut rng, &device);
         let logits = model.forward(x);
         let [b, s, v] = logits.dims();
         let loss = loss_fn.forward(logits.reshape([b * s, v]), y.reshape([b * s]));
@@ -237,23 +298,28 @@ pub fn run(job: Job) {
         let dt = t0.elapsed().as_secs_f32().max(1e-6);
         pending.push(StepPoint { step, loss: r4(loss_v), lr: lr as f32, tok_per_sec: (b * s) as f32 / dt });
 
-        let cadence = probe_step || step % h.eval_every == 0 || step % h.sample_every == 0;
+        let is_eval = step % h.eval_every == 0 || step == h.steps;
+        let is_sample = step % h.sample_every == 0 || step == h.steps;
+        let cadence = probe_step || is_eval || is_sample;
         if last_flush.elapsed() > Duration::from_millis(60) || cadence {
             let _ = tx.send(Event::Steps(std::mem::take(&mut pending)));
             last_flush = Instant::now();
         }
         if cadence {
             let m = model.valid();
-            if probe_step {
-                snapshot(&m, step, &norms, step % (h.probe_every * 5) == 0 || step == h.steps);
-            }
-            if step % h.eval_every == 0 || step == h.steps {
+            if is_eval {
                 eval(&m, step);
             }
-            if step % h.sample_every == 0 || step == h.steps {
-                sample(&m, step);
+            if probe_step || is_sample {
+                let cpu = to_cpu(m);
+                if probe_step {
+                    snapshot(&cpu, step, &norms, step % (h.probe_every * 5) == 0 || step == h.steps);
+                }
+                if is_sample {
+                    sample(&cpu, step);
+                }
             }
-            let _ = tx.send(Event::Status(StatusPayload { state: "running", message: "Training".into(), step, total: h.steps }));
+            let _ = tx.send(Event::Status(StatusPayload { state: "running", message: format!("Training{on}"), step, total: h.steps }));
         }
     }
 
@@ -262,8 +328,7 @@ pub fn run(job: Job) {
     }
     if cancel.load(Ordering::Relaxed) {
         // keep the weights reached so far for inspect / generate
-        let m = model.valid();
-        snapshot(&m, done_steps, &norms, true);
+        snapshot(&to_cpu(model.valid()), done_steps, &norms, true);
         status("stopped", "Stopped — weights kept, you can still generate.".into(), done_steps);
     } else {
         status("done", "Training finished.".into(), done_steps);
@@ -369,6 +434,44 @@ pub(crate) mod tests {
         }
         eprintln!("continue losses first/last: {} -> {}; grad norms: {:?}", losses[0], losses.last().unwrap(), &grads[grads.len().saturating_sub(7)..]);
         assert!(losses.last().unwrap() < &(losses[0] * 0.7), "loss must fall when continuing on new data: {} -> {}", losses[0], losses.last().unwrap());
+    }
+
+    #[test]
+    fn moving_a_model_between_backends_keeps_its_outputs() {
+        let (_, slot) = run_job(GEMMA, 20);
+        let t = slot.lock().unwrap().clone().unwrap();
+        let moved = move_model::<IB, IB>(t.model.clone(), &t.spec, &NdArrayDevice::default());
+        let ids = || Tensor::<IB, 2, Int>::from_data(TensorData::new((0..16).map(|i| (i * 3 % 20) as i64).collect::<Vec<_>>(), [1, 16]), &NdArrayDevice::default());
+        let (a, b) = (t.model.forward(ids()).into_data().to_vec::<f32>().unwrap(), moved.forward(ids()).into_data().to_vec::<f32>().unwrap());
+        let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(diff < 1e-6, "moved model must compute the same logits: {diff}");
+    }
+
+    /// Needs a Vulkan GPU: `cargo test --release gpu_training -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_training_runs_on_the_gpu_and_loss_falls() {
+        let text = "the quick brown fox jumps over the lazy dog. ".repeat(80);
+        let spec: ModelSpec = serde_json::from_str(GEMMA).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let trained: TrainedSlot = Arc::new(Mutex::new(None));
+        let hyper = Hyper { steps: 60, batch_size: 8, seq_len: 32, lr: 5e-3, probe_every: 10, eval_every: 20, sample_every: 20, sample_tokens: 20, device: "gpu".into(), ..Default::default() };
+        let t0 = std::time::Instant::now();
+        run(Job { spec, tok: Arc::new(Tokenized::from_text(&text, 20)), hyper, probe: Arc::new(Mutex::new("the quick brown".into())), cancel: Arc::new(AtomicBool::new(false)), tx, trained: trained.clone(), init: None, own_vocab: false, provenance: Provenance::default() });
+        let (mut losses, mut msgs) = (vec![], vec![]);
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                Event::Steps(p) => losses.extend(p.iter().map(|x| x.loss)),
+                Event::Status(s) => msgs.push(format!("{}: {}", s.state, s.message)),
+                _ => {}
+            }
+        }
+        eprintln!("gpu run took {:?}; statuses: {:?}", t0.elapsed(), msgs);
+        assert!(!msgs.iter().any(|m| m.contains("No usable GPU")), "fell back to the CPU: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("on the GPU")), "{msgs:?}");
+        assert!(msgs.last().unwrap().starts_with("done"), "{msgs:?}");
+        assert!(losses.last().unwrap() < &(losses[0] * 0.6), "loss did not fall: {} -> {}", losses[0], losses.last().unwrap());
+        assert!(trained.lock().unwrap().is_some(), "the CPU copy must be kept for generation");
     }
 
     #[test]

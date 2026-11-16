@@ -53,6 +53,8 @@ export interface Hyper {
   sampleEvery: number;
   sampleTokens: number;
   temperature: number;
+  /** "cpu" (all cores) or "gpu" (Vulkan, falls back to the CPU if unusable). */
+  device: "cpu" | "gpu";
 }
 
 // ---------------------------------------------------------------- payloads

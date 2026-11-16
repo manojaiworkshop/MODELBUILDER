@@ -16,7 +16,7 @@ export const DEFAULT_MERGES = 200;
 
 export const DEFAULT_HYPER: Hyper = {
   steps: 400, batchSize: 16, seqLen: 64, lr: 0.003, warmupSteps: 20, weightDecay: 0.01, gradClip: 1,
-  seed: 42, probeEvery: 10, evalEvery: 25, sampleEvery: 50, sampleTokens: 120, temperature: 0.8,
+  seed: 42, probeEvery: 10, evalEvery: 25, sampleEvery: 50, sampleTokens: 120, temperature: 0.8, device: "cpu",
 };
 
 export const DEFAULT_TOKENIZER: TokenizerInfo = { kind: "default", name: "", model: "", fullVocab: 0 };

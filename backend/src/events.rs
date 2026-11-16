@@ -61,6 +61,8 @@ pub struct Hyper {
     pub sample_every: usize,
     pub sample_tokens: usize,
     pub temperature: f32,
+    /// "cpu" (all cores) or "gpu" (Vulkan); inspection and generation always run on the CPU.
+    pub device: String,
 }
 
 impl Default for Hyper {
@@ -68,6 +70,7 @@ impl Default for Hyper {
         Hyper {
             steps: 300, batch_size: 16, seq_len: 64, lr: 3e-3, warmup_steps: 20, weight_decay: 0.01,
             grad_clip: 1.0, seed: 42, probe_every: 10, eval_every: 25, sample_every: 50, sample_tokens: 80, temperature: 0.8,
+            device: "cpu".into(),
         }
     }
 }
@@ -82,6 +85,7 @@ impl Hyper {
         chk(self.probe_every >= 1 && self.eval_every >= 1 && self.sample_every >= 1, "intervals must be >= 1")?;
         chk(self.sample_tokens <= 500, "sample length must be <= 500")?;
         chk((0.0..=5.0).contains(&self.temperature), "temperature must be 0..5")?;
+        chk(matches!(self.device.as_str(), "" | "cpu" | "gpu"), "device must be \"cpu\" or \"gpu\"")?;
         chk(self.grad_clip >= 0.0 && self.weight_decay >= 0.0, "grad clip / weight decay must be >= 0")
     }
 }

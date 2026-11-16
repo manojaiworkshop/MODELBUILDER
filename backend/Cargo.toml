@@ -29,7 +29,7 @@ rmcp = { version = "0.10", features = ["client", "transport-child-process", "tra
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }   # Learn tab -> user-configured chat endpoint
 
 # CPU-only training engine: tensors + autograd, pure Rust.
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "vulkan", "fusion"] }
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "vulkan", "cuda", "fusion"] }   # cuda: NVIDIA GPUs incl. MIG slices (Vulkan can't see those)
 burn-ndarray = { version = "0.21.0", default-features = false, features = ["std", "multi-threads"] }   # CPU backend: matmuls across all cores (feature-unified into burn's ndarray)
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 arrow-json = "60.0.0"

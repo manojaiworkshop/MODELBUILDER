@@ -1,9 +1,9 @@
 "use client";
 import { useStudio } from "@/lib/store";
 import type { Hyper } from "@/lib/types";
-import { Card, Field, NumberInput, SectionHeader } from "../ui/kit";
+import { Card, Field, NumberInput, SectionHeader, SelectInput } from "../ui/kit";
 
-type Def = { key: keyof Hyper; label: string; help: string; min: number; max: number; step?: number; float?: boolean };
+type Def = { key: Exclude<keyof Hyper, "device">; label: string; help: string; min: number; max: number; step?: number; float?: boolean };
 
 const OPT: Def[] = [
   { key: "steps", label: "Steps", help: "Number of optimizer updates.", min: 1, max: 20000, step: 50 },
@@ -23,7 +23,7 @@ const LIVE: Def[] = [
   { key: "temperature", label: "Temperature", help: "0 = greedy; higher = more random.", min: 0, max: 5, step: 0.1, float: true },
 ];
 
-function Grid({ defs, disabled }: { defs: Def[]; disabled: boolean }) {
+function Grid({ defs, disabled, children }: { defs: Def[]; disabled: boolean; children?: React.ReactNode }) {
   const hyper = useStudio((s) => s.hyper);
   const setHyper = useStudio((s) => s.setHyper);
   return (
@@ -33,19 +33,25 @@ function Grid({ defs, disabled }: { defs: Def[]; disabled: boolean }) {
           <NumberInput value={hyper[d.key]} onChange={(v) => setHyper({ [d.key]: v })} min={d.min} max={d.max} step={d.step} float={d.float} disabled={disabled} />
         </Field>
       ))}
+      {children}
     </div>
   );
 }
 
 export function TrainPanel({ locked }: { locked: boolean }) {
   const hyper = useStudio((s) => s.hyper);
+  const setHyper = useStudio((s) => s.setHyper);
   const tokens = useStudio((s) => s.dataInfo?.tokens);
   const seen = hyper.steps * hyper.batchSize * hyper.seqLen;
   return (
     <div className="space-y-4 p-4">
       <Card>
         <SectionHeader title="Optimization" sub="AdamW with linear warmup then cosine decay." />
-        <Grid defs={OPT} disabled={locked} />
+        <Grid defs={OPT} disabled={locked}>
+          <Field label="Train on" help="CPU uses every core. GPU (Vulkan) is much faster for bigger models, batches and contexts; if it can't be opened the run falls back to the CPU. Snapshots and samples are always computed on the CPU.">
+            <SelectInput value={hyper.device ?? "cpu"} onChange={(v) => setHyper({ device: v as Hyper["device"] })} disabled={locked} options={[{ value: "cpu", label: "CPU (all cores)" }, { value: "gpu", label: "GPU (Vulkan)" }]} />
+          </Field>
+        </Grid>
         <p className="border-t border-border px-4 py-2.5 text-xs text-muted">
           This run processes ≈ {seen.toLocaleString()} tokens
           {tokens ? <> — about {(seen / tokens).toFixed(1)}× your dataset.</> : "."}

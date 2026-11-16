@@ -36,6 +36,25 @@ if ! have node || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ];
   $SUDO apt-get install -y nodejs
 fi
 
+# ---- CUDA compiler bits for GPU training ----
+# The NVIDIA driver ships with the pod, but the CUDA backend compiles its kernels at runtime and
+# needs NVRTC + the CUDA headers. Vulkan can't see MIG GPU slices, so CUDA is the GPU path there.
+# 12.8 is the first release that targets Blackwell. SKIP_CUDA=1 skips this (GPU runs then use the CPU).
+CUDA_VER="${CUDA_VER:-12-8}"
+if [ -z "${SKIP_CUDA:-}" ] && have nvidia-smi && [ ! -f /usr/local/cuda/include/nvrtc.h ]; then
+  . /etc/os-release
+  repo="ubuntu${VERSION_ID//./}"
+  say "Installing CUDA ${CUDA_VER//-/.} NVRTC + headers (for GPU training)"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/keyring.deb" "https://developer.download.nvidia.com/compute/cuda/repos/${repo}/x86_64/cuda-keyring_1.1-1_all.deb"
+  $SUDO dpkg -i "$tmp/keyring.deb"
+  rm -rf "$tmp"
+  $SUDO apt-get update -y
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    "cuda-nvrtc-dev-${CUDA_VER}" "cuda-cudart-dev-${CUDA_VER}" "cuda-crt-${CUDA_VER}" "cuda-cccl-${CUDA_VER}"
+fi
+[ -d /usr/local/cuda ] && export CUDA_PATH=/usr/local/cuda LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # ---- Rust ----
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 if ! have cargo; then
