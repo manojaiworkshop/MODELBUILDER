@@ -56,7 +56,10 @@ fi
 
 # NEXT_PUBLIC_* is baked in at build time, so rebuild when it changes too.
 env_stamp="frontend/.next/.backend-url"
-want_url="${NEXT_PUBLIC_BACKEND_URL:-${PUBLIC_URL:-https://4s0oe8i1a9zseu-${FRONTEND_PORT}.proxy.runpod.net}}"
+# RunPod sets RUNPOD_POD_ID for the container's main process; SSH shells don't inherit it, so read PID 1's env.
+POD_ID="${RUNPOD_POD_ID:-$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p' || true)}"
+[ -n "$POD_ID" ] || [ -n "${PUBLIC_URL:-}${NEXT_PUBLIC_BACKEND_URL:-}" ] || { echo "Cannot detect the RunPod pod id; set PUBLIC_URL=https://<pod>-${FRONTEND_PORT}.proxy.runpod.net" >&2; exit 1; }
+want_url="${NEXT_PUBLIC_BACKEND_URL:-${PUBLIC_URL:-https://${POD_ID}-${FRONTEND_PORT}.proxy.runpod.net}}"
 if [ ! -f frontend/.next/BUILD_ID ] \
    || [ "$(cat "$env_stamp" 2>/dev/null || true)" != "$want_url" ] \
    || [ -n "$(find frontend/src frontend/public frontend/package.json frontend/next.config.ts -newer frontend/.next/BUILD_ID -print -quit 2>/dev/null)" ]; then
@@ -78,6 +81,7 @@ sleep 1
 # page (Next.js on 127.0.0.1:$NEXT_PORT) and forwards /socket.io, /api and /health to the backend
 # (127.0.0.1:$BACKEND_PORT) - the browser then only ever talks to one origin.
 mkdir -p .run
+echo $$ > .run/remotedev.pid   # remotestop.sh kills exactly this launcher
 cat > .run/nginx.conf <<NGINX
 worker_processes 1;
 pid $PWD/.run/nginx.pid;
@@ -104,11 +108,11 @@ http {
   }
 }
 NGINX
-nginx -t -c "$PWD/.run/nginx.conf" -e "$PWD/.run/nginx-error.log"
+nginx -t -c "$PWD/.run/nginx.conf"
 
 say "Starting backend :$BACKEND_PORT, frontend :$NEXT_PORT, proxy :$FRONTEND_PORT"
 trap 'kill 0' EXIT INT TERM
 (cd backend && HOST=127.0.0.1 PORT="$BACKEND_PORT" ./target/release/modelbuilder-backend) &
 (cd frontend && npx next start -H 127.0.0.1 -p "$NEXT_PORT") &
-nginx -c "$PWD/.run/nginx.conf" -e "$PWD/.run/nginx-error.log" -g 'daemon off;' &
+nginx -c "$PWD/.run/nginx.conf" -g 'daemon off;' &
 wait
